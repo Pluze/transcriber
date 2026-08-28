@@ -18,10 +18,28 @@ jobs:
         run: ./scripts/build-ffmpeg.sh
       - name: Build whisper.cpp
         run: ./scripts/build-whisper.sh
-      - name: Build app
-        run: ./build.sh
-      - name: Verify bundle
+      - name: Package app
+        run: ./package.sh
+      - name: Verify app and release shape
         run: |
           codesign --verify --deep --strict Transcriber.app
           test -x Transcriber.app/Contents/Resources/runtime/bin/ffmpeg
           test -x Transcriber.app/Contents/Resources/runtime/bin/whisper-cli
+          ZIP="$(find dist -maxdepth 1 -name 'Transcriber-*-macOS-arm64.zip' -print -quit)"
+          test -n "$ZIP"
+          test "$(zipinfo -1 "$ZIP" | awk -F/ 'length { print $1 }' | sort -u)" = "Transcriber.app"
+          ! zipinfo -1 "$ZIP" | grep -Eq '(^|/)\._|\.sh$'
+      - name: Prepare release inputs
+        if: github.event_name == 'push'
+        run: |
+          mkdir release-inputs
+          cp dist/Transcriber-*-macOS-arm64.zip release-inputs/Transcriber-macOS-arm64.zip
+          cp .build/ffmpeg/ffmpeg-9.0.1.tar.xz release-inputs/FFmpeg-9.0.1-source.tar.xz
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'push'
+        with:
+          name: release-inputs-${{ github.sha }}
+          path: release-inputs/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

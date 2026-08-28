@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-$(plutil -extract CFBundleShortVersionString raw "$ROOT_DIR/Resources/Info.plist")}"
 APP="$ROOT_DIR/Transcriber.app"
 DIST="$ROOT_DIR/dist"
 

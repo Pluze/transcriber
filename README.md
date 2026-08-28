@@ -35,8 +35,10 @@ Requirements: Apple Silicon Mac, macOS 13.3+, Xcode command-line tools, `curl`,
 
 `package.sh` creates `dist/Transcriber-<version>-macOS-arm64.zip`; its top level
 contains only `Transcriber.app`. CI verifies clean source builds without storing
-build artifacts; tagged builds publish the app ZIP as a GitHub Release asset.
-GitHub automatically provides source archives.
+build artifacts in Git. A successful `main` build keeps its release inputs for
+one day; a matching tag promotes those exact, already-verified inputs to a
+persistent GitHub Release without compiling again. GitHub automatically
+provides project source archives.
 
 To distribute without Gatekeeper warnings, set `SIGNING_IDENTITY` to a Developer
 ID Application certificate and `NOTARY_PROFILE` to a configured notarytool
