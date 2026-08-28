@@ -1,0 +1,7 @@
+.DS_Store
+/.build/
+/Transcriber.app/
+/dist/
+/Vendor/ffmpeg/build/
+/ThirdParty/ffmpeg/bin/
+/ThirdParty/whisper/bin/

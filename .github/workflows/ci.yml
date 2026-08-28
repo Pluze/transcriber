@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build FFmpeg
+        run: ./scripts/build-ffmpeg.sh
+      - name: Build whisper.cpp
+        run: ./scripts/build-whisper.sh
+      - name: Build app
+        run: ./build.sh
+      - name: Verify bundle
+        run: |
+          codesign --verify --deep --strict Transcriber.app
+          test -x Transcriber.app/Contents/Resources/runtime/bin/ffmpeg
+          test -x Transcriber.app/Contents/Resources/runtime/bin/whisper-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Transcriber-app
+          path: Transcriber.app

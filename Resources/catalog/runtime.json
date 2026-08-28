@@ -1,0 +1,24 @@
+{
+  "engine": "whisper.cpp",
+  "policyVersion": 1,
+  "compatibleVersionContains": "1.9.1",
+  "environment": {
+    "GGML_METAL_TENSOR_DISABLE": "1"
+  },
+  "arguments": [
+    "--model", "{model}",
+    "--file", "{file}",
+    "--language", "{language}",
+    "--threads", "{threads}",
+    "--processors", "1",
+    "--flash-attn",
+    "--beam-size", "5",
+    "--best-of", "5",
+    "--max-context", "0",
+    "--print-progress",
+    "--output-txt",
+    "--output-srt",
+    "--output-json-full",
+    "--output-file", "{output}"
+  ]
+}

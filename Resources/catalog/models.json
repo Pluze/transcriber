@@ -1,0 +1,32 @@
+[
+  {
+    "id": "maximum",
+    "name": "Maximum Fidelity",
+    "subtitle": "Full 32-layer large-v3. Best recognition and accent robustness.",
+    "filename": "ggml-large-v3.bin",
+    "sha256": "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
+    "downloadURL": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3.bin",
+    "downloadSize": "2.9 GiB",
+    "fidelityRank": 3
+  },
+  {
+    "id": "balanced",
+    "name": "Balanced",
+    "subtitle": "Unquantized large-v3-turbo. Faster with a moderate fidelity tradeoff.",
+    "filename": "ggml-large-v3-turbo.bin",
+    "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+    "downloadURL": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin",
+    "downloadSize": "1.5 GiB",
+    "fidelityRank": 2
+  },
+  {
+    "id": "compact",
+    "name": "Compact",
+    "subtitle": "Quantized turbo q5. Smallest download and lowest storage use.",
+    "filename": "ggml-large-v3-turbo-q5_0.bin",
+    "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+    "downloadURL": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin",
+    "downloadSize": "547 MiB",
+    "fidelityRank": 1
+  }
+]

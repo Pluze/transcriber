@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build FFmpeg
+        run: ./scripts/build-ffmpeg.sh
+      - name: Build whisper.cpp
+        run: ./scripts/build-whisper.sh
+      - name: Package app
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}" ./package.sh
+      - name: Verify release shape
+        run: |
+          test "$(zipinfo -1 dist/*.zip | awk -F/ 'NF == 1 && length { print }' | wc -l | tr -d ' ')" = "1"
+          zipinfo -1 dist/*.zip | head -1 | grep -Fx 'Transcriber.app/'
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.zip --generate-notes --verify-tag
