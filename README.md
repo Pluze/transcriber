@@ -21,6 +21,14 @@ fixed so scheduling does not silently change transcript quality.
 Install two or more models to enable **Bench Installed Models**, which runs the
 whole queue through every installed model with the same runtime policy.
 
+## Install
+
+Download the App ZIP from Releases, unzip it, and drag `Transcriber.app` to
+Applications. This unsigned community build may be blocked the first time it is
+opened: Control-click the app, choose **Open**, then choose **Open** again. This
+one-time confirmation is macOS's supported way to open an app from an
+unidentified developer.
+
 ## Build
 
 Requirements: Apple Silicon Mac, macOS 13.3+, Xcode command-line tools, `curl`,

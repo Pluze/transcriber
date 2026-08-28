@@ -149,7 +149,7 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate {
     }
 }
 
-final class LockedText {
+final class LockedText: @unchecked Sendable {
     private let lock = NSLock()
     private var value = ""
 
@@ -164,6 +164,24 @@ final class LockedText {
         defer { lock.unlock() }
         return value
     }
+
+    func take() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let result = value
+        value.removeAll(keepingCapacity: true)
+        return result
+    }
+}
+
+private struct CPUTickSnapshot {
+    let user: UInt64
+    let system: UInt64
+    let idle: UInt64
+    let nice: UInt64
+
+    var total: UInt64 { user + system + idle + nice }
+    var busy: UInt64 { user + system + nice }
 }
 
 enum TranscriberError: LocalizedError {
@@ -213,6 +231,9 @@ final class TranscriberModel: ObservableObject {
     private var processes: [UUID: Process] = [:]
     private var transcriptionTask: Task<Void, Never>?
     private var downloader: ModelDownloader?
+    private let pendingProcessLog = LockedText()
+    private var logFlushTask: Task<Void, Never>?
+    private var previousCPUTicks: CPUTickSnapshot?
 
     var applicationSupport: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -500,31 +521,50 @@ final class TranscriberModel: ObservableObject {
         lastOutput = nil
         logText = ""
         statusText = "Starting..."
+        startLogPump()
         let queued = recordings
         transcriptionTask = Task {
             do {
                 for (profileIndex, profile) in profiles.enumerated() {
                     var nextIndex = 0
-                    while nextIndex < queued.count {
-                        try Task.checkCancellation()
-                        let remaining = queued.count - nextIndex
-                        let plan = makeExecutionPlan(remainingFiles: remaining, profile: profile)
+                    var completed = 0
+                    var active = 0
+                    try await withThrowingTaskGroup(of: URL.self) { group in
+                        var plan = makeExecutionPlan(remainingFiles: queued.count, profile: profile)
                         optimizationText = plan.reason
-                        let end = min(queued.count, nextIndex + plan.concurrency)
-                        let batch = Array(queued[nextIndex..<end])
-                        let prefix = benchmark ? "Bench \(profileIndex + 1)/\(profiles.count) · \(profile.name) · " : ""
-                        statusText = plan.concurrency > 1
-                            ? "\(prefix)processing \(batch.count) files in parallel (\(nextIndex + 1)–\(end) of \(queued.count))"
-                            : "\(prefix)processing \(nextIndex + 1) of \(queued.count): \(batch[0].lastPathComponent)"
-                        try await withThrowingTaskGroup(of: URL.self) { group in
-                            for recording in batch {
-                                group.addTask { try await self.transcribe(recording, plan: plan, profile: profile, benchmark: benchmark) }
-                            }
-                            for try await output in group {
-                                lastOutput = output.appendingPathComponent("transcript.txt")
-                            }
+
+                        while active < plan.concurrency && nextIndex < queued.count {
+                            let recording = queued[nextIndex]
+                            let jobPlan = plan
+                            nextIndex += 1
+                            active += 1
+                            group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark) }
                         }
-                        nextIndex = end
+
+                        let initialPrefix = benchmark ? "Bench \(profileIndex + 1)/\(profiles.count) · \(profile.name) · " : ""
+                        statusText = "\(initialPrefix)0/\(queued.count) complete · \(active) active"
+
+                        while let output = try await group.next() {
+                            active -= 1
+                            completed += 1
+                            lastOutput = output.appendingPathComponent("transcript.txt")
+                            try Task.checkCancellation()
+
+                            let remaining = queued.count - completed
+                            guard remaining > 0 else { continue }
+                            plan = makeExecutionPlan(remainingFiles: remaining, profile: profile)
+                            optimizationText = plan.reason
+                            while active < plan.concurrency && nextIndex < queued.count {
+                                let recording = queued[nextIndex]
+                                let jobPlan = plan
+                                nextIndex += 1
+                                active += 1
+                                group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark) }
+                            }
+
+                            let prefix = benchmark ? "Bench \(profileIndex + 1)/\(profiles.count) · \(profile.name) · " : ""
+                            statusText = "\(prefix)\(completed)/\(queued.count) complete · \(active) active"
+                        }
                     }
                 }
                 statusText = benchmark ? "Benchmark completed" : "Completed"
@@ -535,6 +575,7 @@ final class TranscriberModel: ObservableObject {
                 statusText = "Failed — \(error.localizedDescription)"
                 appendLog("\nERROR: \(error.localizedDescription)\n")
             }
+            stopLogPump()
             isRunning = false
             processes.removeAll()
             transcriptionTask = nil
@@ -554,7 +595,30 @@ final class TranscriberModel: ObservableObject {
 
     private func appendLog(_ text: String) {
         logText += text
-        if logText.count > 100_000 { logText.removeFirst(logText.count - 100_000) }
+        if logText.count > 60_000 { logText.removeFirst(logText.count - 60_000) }
+    }
+
+    private func startLogPump() {
+        logFlushTask?.cancel()
+        _ = pendingProcessLog.take()
+        logFlushTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled else { break }
+                self?.flushProcessLog()
+            }
+        }
+    }
+
+    private func stopLogPump() {
+        logFlushTask?.cancel()
+        logFlushTask = nil
+        flushProcessLog()
+    }
+
+    private func flushProcessLog() {
+        let text = pendingProcessLog.take()
+        if !text.isEmpty { appendLog(text) }
     }
 
     private func transcribe(_ input: URL, plan: ExecutionPlan, profile: ModelProfile, benchmark: Bool) async throws -> URL {
@@ -629,11 +693,12 @@ final class TranscriberModel: ObservableObject {
         task.standardOutput = pipe
         task.standardError = pipe
         processes[jobID] = task
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        let liveLog = pendingProcessLog
+        pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             collector.append(text)
-            Task { @MainActor in self?.appendLog(text) }
+            liveLog.append(text)
         }
         let status: Int32 = try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
@@ -667,12 +732,13 @@ final class TranscriberModel: ObservableObject {
         let runtimeEnvironment = RuntimePolicy.bundled.environment.merging(["DYLD_LIBRARY_PATH": bundledRuntime.path]) { _, new in new }
         task.environment = ProcessInfo.processInfo.environment.merging(runtimeEnvironment) { _, new in new }
         processes[jobID] = task
+        let liveLog = pendingProcessLog
 
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             collector.append(text)
-            Task { @MainActor in self?.appendLog(text) }
+            liveLog.append(text)
         }
 
         let status: Int32 = try await withTaskCancellationHandler(operation: {
@@ -708,21 +774,51 @@ final class TranscriberModel: ObservableObject {
         let availableGiB = Self.availableMemoryGiB()
         let reservePerJob: Double
         switch profile.id {
-        case ModelProfile.maximum.id: reservePerJob = 5.5
-        case ModelProfile.balanced.id: reservePerJob = 3.5
-        default: reservePerJob = 2.0
+        case ModelProfile.maximum.id: reservePerJob = 4.25
+        case ModelProfile.balanced.id: reservePerJob = 2.5
+        default: reservePerJob = 1.5
         }
-        let memorySlots = max(1, Int(max(0, availableGiB - 3.0) / reservePerJob))
-        let coreSlots = max(1, cores / 5)
+        let memorySlots = max(1, Int(max(0, availableGiB - 2.0) / reservePerJob))
+        let baselineCoreSlots = max(1, min(6, (cores + 2) / 3))
+        let cpuUtilization = sampleCPUUtilization()
+        var coreSlots = baselineCoreSlots
+        if let cpuUtilization, cpuUtilization < 0.60 {
+            coreSlots = min(6, max(coreSlots, (cores + 1) / 2))
+        } else if let cpuUtilization, cpuUtilization > 0.92 {
+            coreSlots = max(1, coreSlots - 1)
+        }
         let thermal = ProcessInfo.processInfo.thermalState
         let constrained = ProcessInfo.processInfo.isLowPowerModeEnabled || thermal == .serious || thermal == .critical
         let concurrency = constrained ? 1 : max(1, min(remainingFiles, min(memorySlots, coreSlots)))
-        let threads = max(2, min(8, cores / concurrency))
+        let threads = max(3, min(10, Int(ceil(Double(cores) / Double(concurrency))) + (concurrency == 1 ? 0 : 1)))
         let state = constrained ? "power/thermal protection active" : "system headroom available"
+        let cpuText = cpuUtilization.map { " · CPU \(Int($0 * 100))%" } ?? ""
         let reason = concurrency == 1
-            ? "Automatic: \(threads) threads on one file · \(String(format: "%.1f", availableGiB)) GiB available · \(state)"
-            : "Automatic: \(concurrency) files in parallel × \(threads) threads · \(String(format: "%.1f", availableGiB)) GiB available"
+            ? "Automatic: \(threads) threads on one file · \(String(format: "%.1f", availableGiB)) GiB available\(cpuText) · \(state)"
+            : "Automatic: \(concurrency) rolling workers × \(threads) threads · \(String(format: "%.1f", availableGiB)) GiB available\(cpuText)"
         return ExecutionPlan(concurrency: concurrency, threadsPerFile: threads, reason: reason)
+    }
+
+    private func sampleCPUUtilization() -> Double? {
+        var load = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &load) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        let current = CPUTickSnapshot(
+            user: UInt64(load.cpu_ticks.0),
+            system: UInt64(load.cpu_ticks.1),
+            idle: UInt64(load.cpu_ticks.2),
+            nice: UInt64(load.cpu_ticks.3)
+        )
+        defer { previousCPUTicks = current }
+        guard let previous = previousCPUTicks,
+              current.total > previous.total,
+              current.busy >= previous.busy else { return nil }
+        return Double(current.busy - previous.busy) / Double(current.total - previous.total)
     }
 
     nonisolated private static func availableMemoryGiB() -> Double {
@@ -738,7 +834,7 @@ final class TranscriberModel: ObservableObject {
         guard result == KERN_SUCCESS else {
             return Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
         }
-        let pages = UInt64(statistics.free_count + statistics.inactive_count)
+        let pages = UInt64(statistics.free_count + statistics.inactive_count + statistics.speculative_count + statistics.purgeable_count)
         return Double(pages * UInt64(pageSize)) / 1_073_741_824.0
     }
 

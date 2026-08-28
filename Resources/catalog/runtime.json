@@ -1,10 +1,8 @@
 {
   "engine": "whisper.cpp",
-  "policyVersion": 1,
+  "policyVersion": 2,
   "compatibleVersionContains": "1.9.1",
-  "environment": {
-    "GGML_METAL_TENSOR_DISABLE": "1"
-  },
+  "environment": {},
   "arguments": [
     "--model", "{model}",
     "--file", "{file}",
@@ -15,7 +13,6 @@
     "--beam-size", "5",
     "--best-of", "5",
     "--max-context", "0",
-    "--print-progress",
     "--output-txt",
     "--output-srt",
     "--output-json-full",

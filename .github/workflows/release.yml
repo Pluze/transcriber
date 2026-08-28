@@ -12,6 +12,7 @@ jobs:
   release:
     runs-on: macos-15
     steps:
+      - uses: actions/checkout@v4
       - name: Download inputs from successful CI
         env:
           GH_TOKEN: ${{ github.token }}
@@ -33,4 +34,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
             release-inputs/Transcriber-*-macOS-arm64.zip \
             release-inputs/FFmpeg-9.0.1-source.tar.xz \
+            --notes-file .github/release-notes.md \
             --generate-notes --verify-tag

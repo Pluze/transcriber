@@ -21,6 +21,7 @@ trap cleanup EXIT INT TERM
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources/runtime/bin" "$CONTENTS/Resources/licenses" "$CONTENTS/Resources/catalog" "$BUILD_TEMP/module-cache"
 cp "$PLIST" "$CONTENTS/Info.plist"
+cp "$ROOT_DIR/Resources/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
 cp -a "$ROOT_DIR/ThirdParty/whisper/bin/." "$CONTENTS/Resources/runtime/bin/"
 cp "$ROOT_DIR/ThirdParty/ffmpeg/bin/ffmpeg" "$CONTENTS/Resources/runtime/bin/ffmpeg"
 cp -a "$ROOT_DIR/ThirdParty/licenses/." "$CONTENTS/Resources/licenses/"
