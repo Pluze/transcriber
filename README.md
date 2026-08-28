@@ -49,6 +49,9 @@ created beside their source files in a new `<name>.transcript` directory.
 
 ## Third-party components
 
+Transcriber's original source code is licensed under the MIT License; see
+`LICENSE`.
+
 This project bundles whisper.cpp and an LGPL-only FFmpeg build. Notices are in
 `ThirdParty/licenses` and are copied into the app bundle. Each tagged GitHub
 Release also includes the exact FFmpeg source archive used to build its binary;

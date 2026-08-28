@@ -24,6 +24,7 @@ cp "$PLIST" "$CONTENTS/Info.plist"
 cp -a "$ROOT_DIR/ThirdParty/whisper/bin/." "$CONTENTS/Resources/runtime/bin/"
 cp "$ROOT_DIR/ThirdParty/ffmpeg/bin/ffmpeg" "$CONTENTS/Resources/runtime/bin/ffmpeg"
 cp -a "$ROOT_DIR/ThirdParty/licenses/." "$CONTENTS/Resources/licenses/"
+cp "$ROOT_DIR/LICENSE" "$CONTENTS/Resources/licenses/Transcriber-LICENSE"
 cp "$ROOT_DIR/Resources/catalog/"*.json "$CONTENTS/Resources/catalog/"
 
 "$SWIFTC_BIN" -parse-as-library -O -whole-module-optimization \
