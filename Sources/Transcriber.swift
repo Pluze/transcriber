@@ -1,6 +1,7 @@
 import AppKit
 import CryptoKit
 import Darwin
+import IOKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -28,6 +29,26 @@ struct ModelProfile: Identifiable, Hashable, Codable {
     static var compact: ModelProfile { all.first { $0.id == "compact" }! }
 }
 
+struct LanguageOption: Identifiable, Hashable, Codable {
+    let code: String
+    let name: String
+    var id: String { code }
+
+    static let all: [LanguageOption] = {
+        guard let url = Bundle.main.url(forResource: "languages", withExtension: "json", subdirectory: "catalog"),
+              let data = try? Data(contentsOf: url),
+              let languages = try? JSONDecoder().decode([LanguageOption].self, from: data),
+              !languages.isEmpty else {
+            return [
+                LanguageOption(code: "auto", name: "Auto — dominant language"),
+                LanguageOption(code: "en", name: "English"),
+                LanguageOption(code: "zh", name: "Chinese"),
+            ]
+        }
+        return [LanguageOption(code: "auto", name: "Auto — dominant language")] + languages
+    }()
+}
+
 extension Notification.Name {
     static let transcriberOpenFiles = Notification.Name("TranscriberOpenFiles")
 }
@@ -36,14 +57,22 @@ struct HardwareProfile {
     let chip: String
     let memoryGiB: Int
     let logicalCores: Int
+    let performanceCores: Int
     let threads: Int
 
     static func current() -> HardwareProfile {
         let bytes = ProcessInfo.processInfo.physicalMemory
         let memory = Int((Double(bytes) / 1_073_741_824.0).rounded())
         let cores = ProcessInfo.processInfo.processorCount
+        let performanceCores = sysctlInt("hw.perflevel0.logicalcpu") ?? max(2, cores / 2)
         let chip = sysctlString("machdep.cpu.brand_string") ?? "Apple Silicon"
-        return HardwareProfile(chip: chip, memoryGiB: memory, logicalCores: cores, threads: min(8, max(2, cores)))
+        return HardwareProfile(
+            chip: chip,
+            memoryGiB: memory,
+            logicalCores: cores,
+            performanceCores: performanceCores,
+            threads: max(2, min(8, performanceCores))
+        )
     }
 
     var recommendation: String {
@@ -60,7 +89,14 @@ struct HardwareProfile {
     }
 
     var details: String {
-        "Unquantized large-v3 · Metal · beam 5 · \(threads) CPU threads · context reset"
+        "Unquantized large-v3 · Metal · beam 5 · \(threads) performance-core threads · context reset"
+    }
+
+    private static func sysctlInt(_ name: String) -> Int? {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname(name, &value, &size, nil, 0) == 0, value > 0 else { return nil }
+        return Int(value)
     }
 
     private static func sysctlString(_ name: String) -> String? {
@@ -231,8 +267,6 @@ final class TranscriberModel: ObservableObject {
     private var processes: [UUID: Process] = [:]
     private var transcriptionTask: Task<Void, Never>?
     private var downloader: ModelDownloader?
-    private let pendingProcessLog = LockedText()
-    private var logFlushTask: Task<Void, Never>?
     private var previousCPUTicks: CPUTickSnapshot?
 
     var applicationSupport: URL {
@@ -519,18 +553,20 @@ final class TranscriberModel: ObservableObject {
         }
         isRunning = true
         lastOutput = nil
-        logText = ""
+        logText = "Transcription started. Detailed engine output is saved with each result."
         statusText = "Starting..."
-        startLogPump()
         let queued = recordings
         transcriptionTask = Task {
             do {
+                primeCPUUtilization()
+                try await Task.sleep(nanoseconds: 250_000_000)
                 for (profileIndex, profile) in profiles.enumerated() {
                     var nextIndex = 0
                     var completed = 0
                     var active = 0
+                    let concurrencyCeiling = makeConcurrencyCeiling(profile: profile)
                     try await withThrowingTaskGroup(of: URL.self) { group in
-                        var plan = makeExecutionPlan(remainingFiles: queued.count, profile: profile)
+                        var plan = makeExecutionPlan(remainingFiles: queued.count, profile: profile, concurrencyCeiling: concurrencyCeiling)
                         optimizationText = plan.reason
 
                         while active < plan.concurrency && nextIndex < queued.count {
@@ -552,7 +588,7 @@ final class TranscriberModel: ObservableObject {
 
                             let remaining = queued.count - completed
                             guard remaining > 0 else { continue }
-                            plan = makeExecutionPlan(remainingFiles: remaining, profile: profile)
+                            plan = makeExecutionPlan(remainingFiles: remaining, profile: profile, concurrencyCeiling: concurrencyCeiling)
                             optimizationText = plan.reason
                             while active < plan.concurrency && nextIndex < queued.count {
                                 let recording = queued[nextIndex]
@@ -575,7 +611,6 @@ final class TranscriberModel: ObservableObject {
                 statusText = "Failed — \(error.localizedDescription)"
                 appendLog("\nERROR: \(error.localizedDescription)\n")
             }
-            stopLogPump()
             isRunning = false
             processes.removeAll()
             transcriptionTask = nil
@@ -595,30 +630,7 @@ final class TranscriberModel: ObservableObject {
 
     private func appendLog(_ text: String) {
         logText += text
-        if logText.count > 60_000 { logText.removeFirst(logText.count - 60_000) }
-    }
-
-    private func startLogPump() {
-        logFlushTask?.cancel()
-        _ = pendingProcessLog.take()
-        logFlushTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled else { break }
-                self?.flushProcessLog()
-            }
-        }
-    }
-
-    private func stopLogPump() {
-        logFlushTask?.cancel()
-        logFlushTask = nil
-        flushProcessLog()
-    }
-
-    private func flushProcessLog() {
-        let text = pendingProcessLog.take()
-        if !text.isEmpty { appendLog(text) }
+        if logText.count > 12_000 { logText.removeFirst(logText.count - 12_000) }
     }
 
     private func transcribe(_ input: URL, plan: ExecutionPlan, profile: ModelProfile, benchmark: Bool) async throws -> URL {
@@ -660,7 +672,7 @@ final class TranscriberModel: ObservableObject {
 
         - Source: `\(input.path)`
         - Processing time: `\(String(format: "%.1f", elapsed)) seconds`
-        - Hardware: `\(hardware.chip), \(hardware.memoryGiB) GiB, \(hardware.logicalCores) logical cores`
+        - Hardware: `\(hardware.chip), \(hardware.memoryGiB) GiB, \(hardware.logicalCores) logical cores, \(hardware.performanceCores) performance cores`
         - Profile: \(profile.name)
         - Model: \(profile.filename)
         - Model path: `\(modelURL(for: profile).path)`
@@ -669,7 +681,7 @@ final class TranscriberModel: ObservableObject {
         - Runtime policy: v\(RuntimePolicy.bundled.policyVersion), compatible with \(RuntimePolicy.bundled.engine) \(RuntimePolicy.bundled.compatibleVersionContains)x
         - Effective arguments: `\(resolvedWhisperArguments(wav: wav, outputStem: outputStem, profile: profile, threads: plan.threadsPerFile).joined(separator: " "))`
         - Engine environment: `\(RuntimePolicy.bundled.environment.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "))`
-        - Scheduler: \(plan.concurrency) concurrent file(s); dynamically selected from queue, memory, power, and thermal state
+        - Scheduler: \(plan.concurrency) Metal inference worker(s); concurrency and CPU helper threads selected from the model, performance cores, GPU/CPU load, memory, power, and thermal state
         - Temporary PCM: deleted
         - Media decoder: bundled FFmpeg (first audio stream)
         """
@@ -693,12 +705,10 @@ final class TranscriberModel: ObservableObject {
         task.standardOutput = pipe
         task.standardError = pipe
         processes[jobID] = task
-        let liveLog = pendingProcessLog
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             collector.append(text)
-            liveLog.append(text)
         }
         let status: Int32 = try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
@@ -732,13 +742,10 @@ final class TranscriberModel: ObservableObject {
         let runtimeEnvironment = RuntimePolicy.bundled.environment.merging(["DYLD_LIBRARY_PATH": bundledRuntime.path]) { _, new in new }
         task.environment = ProcessInfo.processInfo.environment.merging(runtimeEnvironment) { _, new in new }
         processes[jobID] = task
-        let liveLog = pendingProcessLog
-
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             collector.append(text)
-            liveLog.append(text)
         }
 
         let status: Int32 = try await withTaskCancellationHandler(operation: {
@@ -769,8 +776,17 @@ final class TranscriberModel: ObservableObject {
         return RuntimePolicy.bundled.arguments.map { replacements[$0] ?? $0 }
     }
 
-    private func makeExecutionPlan(remainingFiles: Int, profile: ModelProfile) -> ExecutionPlan {
-        let cores = max(2, hardware.logicalCores)
+    private func makeConcurrencyCeiling(profile: ModelProfile) -> Int {
+        guard profile.id == ModelProfile.balanced.id,
+              Self.availableMemoryGiB() >= 7.0,
+              !ProcessInfo.processInfo.isLowPowerModeEnabled,
+              ProcessInfo.processInfo.thermalState != .serious,
+              ProcessInfo.processInfo.thermalState != .critical else { return 1 }
+        guard let gpu = Self.gpuUtilization(), gpu < 0.50 else { return 1 }
+        return 2
+    }
+
+    private func makeExecutionPlan(remainingFiles: Int, profile: ModelProfile, concurrencyCeiling: Int) -> ExecutionPlan {
         let availableGiB = Self.availableMemoryGiB()
         let reservePerJob: Double
         switch profile.id {
@@ -778,24 +794,30 @@ final class TranscriberModel: ObservableObject {
         case ModelProfile.balanced.id: reservePerJob = 2.5
         default: reservePerJob = 1.5
         }
-        let memorySlots = max(1, Int(max(0, availableGiB - 2.0) / reservePerJob))
-        let baselineCoreSlots = max(1, min(6, (cores + 2) / 3))
         let cpuUtilization = sampleCPUUtilization()
-        var coreSlots = baselineCoreSlots
-        if let cpuUtilization, cpuUtilization < 0.60 {
-            coreSlots = min(6, max(coreSlots, (cores + 1) / 2))
-        } else if let cpuUtilization, cpuUtilization > 0.92 {
-            coreSlots = max(1, coreSlots - 1)
-        }
         let thermal = ProcessInfo.processInfo.thermalState
         let constrained = ProcessInfo.processInfo.isLowPowerModeEnabled || thermal == .serious || thermal == .critical
-        let concurrency = constrained ? 1 : max(1, min(remainingFiles, min(memorySlots, coreSlots)))
-        let threads = max(3, min(10, Int(ceil(Double(cores) / Double(concurrency))) + (concurrency == 1 ? 0 : 1)))
-        let state = constrained ? "power/thermal protection active" : "system headroom available"
+        let cpuBusy = (cpuUtilization ?? 0) > 0.90
+        let memorySlots = max(1, Int(max(0, availableGiB - 2.0) / reservePerJob))
+        let concurrency = constrained || cpuBusy ? 1 : max(1, min(remainingFiles, min(memorySlots, concurrencyCeiling)))
+        let baseThreads = max(2, min(8, hardware.performanceCores))
+        let threads = constrained || cpuBusy ? max(2, baseThreads - 1) : baseThreads
+        let memorySafe = availableGiB >= reservePerJob + 1.0
+        let state: String
+        if constrained {
+            state = "power/thermal protection active"
+        } else if cpuBusy {
+            state = "high system CPU load; helper threads reduced"
+        } else if !memorySafe {
+            state = "low memory headroom; serial GPU mode"
+        } else if concurrency > 1 {
+            state = "dual workers validated for this model"
+        } else {
+            state = "serial Metal mode avoids GPU contention"
+        }
         let cpuText = cpuUtilization.map { " · CPU \(Int($0 * 100))%" } ?? ""
-        let reason = concurrency == 1
-            ? "Automatic: \(threads) threads on one file · \(String(format: "%.1f", availableGiB)) GiB available\(cpuText) · \(state)"
-            : "Automatic: \(concurrency) rolling workers × \(threads) threads · \(String(format: "%.1f", availableGiB)) GiB available\(cpuText)"
+        let queueText = remainingFiles > 1 ? " · \(remainingFiles) queued" : ""
+        let reason = "Automatic: \(concurrency) Metal worker\(concurrency == 1 ? "" : "s") × \(threads) performance-core threads · \(String(format: "%.1f", availableGiB)) GiB available\(cpuText)\(queueText) · \(state)"
         return ExecutionPlan(concurrency: concurrency, threadsPerFile: threads, reason: reason)
     }
 
@@ -821,6 +843,23 @@ final class TranscriberModel: ObservableObject {
         return Double(current.busy - previous.busy) / Double(current.total - previous.total)
     }
 
+    private func primeCPUUtilization() {
+        var load = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &load) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return }
+        previousCPUTicks = CPUTickSnapshot(
+            user: UInt64(load.cpu_ticks.0),
+            system: UInt64(load.cpu_ticks.1),
+            idle: UInt64(load.cpu_ticks.2),
+            nice: UInt64(load.cpu_ticks.3)
+        )
+    }
+
     nonisolated private static func availableMemoryGiB() -> Double {
         var pageSize: vm_size_t = 0
         host_page_size(mach_host_self(), &pageSize)
@@ -836,6 +875,24 @@ final class TranscriberModel: ObservableObject {
         }
         let pages = UInt64(statistics.free_count + statistics.inactive_count + statistics.speculative_count + statistics.purgeable_count)
         return Double(pages * UInt64(pageSize)) / 1_073_741_824.0
+    }
+
+    nonisolated private static func gpuUtilization() -> Double? {
+        guard let matching = IOServiceMatching("AGXAccelerator") else { return nil }
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+        let service = IOIteratorNext(iterator)
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let property = IORegistryEntryCreateCFProperty(
+            service,
+            "PerformanceStatistics" as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() as? [String: Any],
+              let utilization = property["Device Utilization %"] as? NSNumber else { return nil }
+        return min(1.0, max(0.0, utilization.doubleValue / 100.0))
     }
 
     private func runtimeIsCompatible() -> Bool {
@@ -866,7 +923,7 @@ struct HardwareCard: View {
                 .font(.system(size: 30))
                 .foregroundStyle(Color.accentColor)
             VStack(alignment: .leading, spacing: 3) {
-                Text("\(profile.chip) · \(profile.memoryGiB) GiB · \(profile.logicalCores) logical cores")
+                Text("\(profile.chip) · \(profile.memoryGiB) GiB · \(profile.logicalCores) logical cores (\(profile.performanceCores) performance)")
                     .font(.headline)
                 Text("Recommended: \(profile.recommendation)")
                     .font(.subheadline.weight(.medium))
@@ -1062,10 +1119,14 @@ struct TranscribeView: View {
                     .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 Spacer()
                 Picker("Language", selection: $model.selectedLanguage) {
-                    Text("English").tag("en")
-                    Text("中文").tag("zh")
-                    Text("Auto Detect").tag("auto")
-                }.frame(width: 170).disabled(model.isRunning)
+                    ForEach(LanguageOption.all) { language in
+                        Text("\(language.name) (\(language.code))").tag(language.code)
+                    }
+                }.frame(width: 245).disabled(model.isRunning)
+            }
+            if model.selectedLanguage == "auto" {
+                Text("Auto detects one dominant language for the whole file; frequent language switching may be less reliable.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             DropZone(disabled: model.isRunning, onFiles: model.addRecordings)
             HStack {
@@ -1103,7 +1164,7 @@ struct TranscribeView: View {
                     }.frame(minHeight: 90, maxHeight: 150)
                 }
             }
-            GroupBox("Activity") {
+            GroupBox("Activity summary") {
                 ScrollView {
                     Text(model.logText).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .topLeading).padding(8)

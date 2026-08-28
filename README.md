@@ -13,10 +13,13 @@ receive TXT, SRT, full JSON, logs, and run metadata beside the source file.
   modifying or deleting the old copy.
 - Temporary 16 kHz mono PCM is deleted after every run.
 
-The default `Maximum Fidelity` model prioritizes recognition quality. CPU/GPU
-use and multi-file concurrency are selected automatically from the model, queue,
-available memory, power mode, and thermal state. Beam/context settings remain
-fixed so scheduling does not silently change transcript quality.
+The default `Maximum Fidelity` model prioritizes recognition quality. The app
+uses the Mac's performance-core count and probes CPU load, Metal GPU activity,
+available memory, power mode, and thermal state before scheduling work. On the
+reference M5 hardware, Maximum Fidelity and Compact use one Metal worker to
+avoid GPU contention; Balanced may use two only when GPU and memory headroom
+allow it. Beam/context settings remain fixed so scheduling does not silently
+change transcript quality.
 
 Install two or more models to enable **Bench Installed Models**, which runs the
 whole queue through every installed model with the same runtime policy.

@@ -31,7 +31,7 @@ cp "$ROOT_DIR/Resources/catalog/"*.json "$CONTENTS/Resources/catalog/"
 "$SWIFTC_BIN" -parse-as-library -O -whole-module-optimization \
   -target arm64-apple-macos13.3 -sdk "$SDK_PATH" \
   -module-cache-path "$BUILD_TEMP/module-cache" \
-  -framework SwiftUI -framework AppKit -framework CryptoKit \
+  -framework SwiftUI -framework AppKit -framework CryptoKit -framework IOKit \
   "$SOURCE" -o "$CONTENTS/MacOS/Transcriber"
 
 SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
