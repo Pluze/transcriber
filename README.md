@@ -50,4 +50,6 @@ created beside their source files in a new `<name>.transcript` directory.
 ## Third-party components
 
 This project bundles whisper.cpp and an LGPL-only FFmpeg build. Notices are in
-`ThirdParty/licenses` and are copied into the app bundle.
+`ThirdParty/licenses` and are copied into the app bundle. Each tagged GitHub
+Release also includes the exact FFmpeg source archive used to build its binary;
+the reproducible configure options are recorded in `scripts/build-ffmpeg.sh`.

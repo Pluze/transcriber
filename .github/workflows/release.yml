@@ -11,7 +11,7 @@ jobs:
   release:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build FFmpeg
         run: ./scripts/build-ffmpeg.sh
       - name: Build whisper.cpp
@@ -28,4 +28,8 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.zip --generate-notes --verify-tag
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.zip \
+            .build/ffmpeg/ffmpeg-9.0.1.tar.xz#FFmpeg-9.0.1-source.tar.xz \
+            --generate-notes --verify-tag
