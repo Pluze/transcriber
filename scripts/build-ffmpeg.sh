@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${FFMPEG_VERSION:-9.0.1}"
+SOURCE_SHA256="${FFMPEG_SOURCE_SHA256:-cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635}"
 BUILD_ROOT="$ROOT_DIR/.build/ffmpeg"
 ARCHIVE="$BUILD_ROOT/ffmpeg-$VERSION.tar.xz"
 SOURCE_DIR="$BUILD_ROOT/ffmpeg-$VERSION"
@@ -18,6 +19,8 @@ mkdir -p "$BUILD_ROOT" "$ROOT_DIR/ThirdParty/ffmpeg/bin"
 if [[ ! -f "$ARCHIVE" ]]; then
   curl --fail --location --retry 3 "https://ffmpeg.org/releases/ffmpeg-$VERSION.tar.xz" --output "$ARCHIVE"
 fi
+ACTUAL_SHA256="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+[[ "$ACTUAL_SHA256" == "$SOURCE_SHA256" ]] || { echo "FFmpeg source checksum mismatch" >&2; exit 1; }
 if [[ "${REUSE_SOURCE:-0}" != "1" ]]; then
   rm -rf "$SOURCE_DIR" "$PREFIX"
   tar -xf "$ARCHIVE" -C "$BUILD_ROOT"

@@ -2,8 +2,7 @@
 
 A standalone, local macOS app for high-fidelity lecture transcription. Drop any
 media file from which FFmpeg can extract an audio stream, choose a model and
-performance mode, and receive TXT, SRT, full JSON, logs, and run metadata beside
-the source file.
+receive TXT, SRT, full JSON, logs, and run metadata beside the source file.
 
 ## User experience
 
@@ -35,7 +34,9 @@ Requirements: Apple Silicon Mac, macOS 13.3+, Xcode command-line tools, `curl`,
 ```
 
 `package.sh` creates `dist/Transcriber-<version>-macOS-arm64.zip`; its top level
-contains only `Transcriber.app`. GitHub automatically provides source archives.
+contains only `Transcriber.app`. CI verifies clean source builds without storing
+build artifacts; tagged builds publish the app ZIP as a GitHub Release asset.
+GitHub automatically provides source archives.
 
 To distribute without Gatekeeper warnings, set `SIGNING_IDENTITY` to a Developer
 ID Application certificate and `NOTARY_PROFILE` to a configured notarytool

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${WHISPER_VERSION:-1.9.1}"
+SOURCE_SHA256="${WHISPER_SOURCE_SHA256:-147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447}"
 BUILD_ROOT="$ROOT_DIR/.build/whisper"
 ARCHIVE="$BUILD_ROOT/whisper.cpp-v$VERSION.tar.gz"
 SOURCE_DIR="$BUILD_ROOT/whisper.cpp-$VERSION"
@@ -19,6 +20,8 @@ mkdir -p "$BUILD_ROOT"
 if [[ ! -f "$ARCHIVE" ]]; then
   curl --fail --location --retry 3 "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v$VERSION.tar.gz" --output "$ARCHIVE"
 fi
+ACTUAL_SHA256="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+[[ "$ACTUAL_SHA256" == "$SOURCE_SHA256" ]] || { echo "whisper.cpp source checksum mismatch" >&2; exit 1; }
 rm -rf "$SOURCE_DIR" "$PREFIX" "$ROOT_DIR/ThirdParty/whisper/bin"
 tar -xzf "$ARCHIVE" -C "$BUILD_ROOT"
 
