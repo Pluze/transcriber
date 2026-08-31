@@ -212,20 +212,51 @@ final class LockedText: @unchecked Sendable {
 
 final class JobProgressStore: @unchecked Sendable {
     private let lock = NSLock()
+    private var weights: [UUID: Double] = [:]
     private var values: [UUID: Double] = [:]
     private var tails: [UUID: String] = [:]
+    private var active: Set<UUID> = []
 
     func reset() {
         lock.lock()
         defer { lock.unlock() }
+        weights.removeAll(keepingCapacity: true)
         values.removeAll(keepingCapacity: true)
         tails.removeAll(keepingCapacity: true)
+        active.removeAll(keepingCapacity: true)
     }
 
-    func begin(_ id: UUID) {
+    func configure(_ units: [UUID: Double]) {
         lock.lock()
         defer { lock.unlock() }
-        values[id] = 0
+        weights = units.mapValues { max(0.001, $0) }
+        values = Dictionary(uniqueKeysWithValues: units.keys.map { ($0, 0) })
+        tails.removeAll(keepingCapacity: true)
+        active.removeAll(keepingCapacity: true)
+    }
+
+    func activate(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        active.insert(id)
+    }
+
+    func deactivate(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        active.remove(id)
+        tails.removeValue(forKey: id)
+    }
+
+    func extractionCompleted(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        values[id] = max(values[id] ?? 0, 0.02)
+    }
+
+    func beginEngine(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
         tails[id] = ""
     }
 
@@ -237,25 +268,41 @@ final class JobProgressStore: @unchecked Sendable {
         for part in combined.components(separatedBy: "progress =").dropFirst() {
             let digits = part.drop(while: { $0 == " " || $0 == "\t" }).prefix(while: { $0.isNumber })
             if let percent = Double(digits) {
-                best = max(best, min(1, percent / 100))
+                best = max(best, min(0.99, 0.02 + (0.97 * percent / 100)))
             }
         }
         values[id] = best
         tails[id] = String(combined.suffix(128))
     }
 
-    func end(_ id: UUID) {
+    func endEngine(_ id: UUID) {
         lock.lock()
         defer { lock.unlock() }
-        values.removeValue(forKey: id)
         tails.removeValue(forKey: id)
     }
 
-    func average() -> Double? {
+    func complete(_ id: UUID) {
         lock.lock()
         defer { lock.unlock() }
-        guard !values.isEmpty else { return nil }
-        return values.values.reduce(0, +) / Double(values.count)
+        values[id] = 1
+        active.remove(id)
+        tails.removeValue(forKey: id)
+    }
+
+    func snapshot() -> (queue: Double, active: Double?, activeIDs: Set<UUID>)? {
+        lock.lock()
+        defer { lock.unlock() }
+        let totalWeight = weights.values.reduce(0, +)
+        guard totalWeight > 0 else { return nil }
+        let completedWeight = weights.reduce(0.0) { result, unit in
+            result + unit.value * min(1, max(0, values[unit.key] ?? 0))
+        }
+        let queueFraction = min(1, completedWeight / totalWeight)
+        let activeWeight = active.reduce(0.0) { $0 + (weights[$1] ?? 0) }
+        let activeCompleted = active.reduce(0.0) {
+            $0 + (weights[$1] ?? 0) * min(1, max(0, values[$1] ?? 0))
+        }
+        return (queueFraction, activeWeight > 0 ? activeCompleted / activeWeight : nil, active)
     }
 }
 
@@ -280,6 +327,7 @@ enum TranscriberError: LocalizedError {
     case runtimeIncompatible
     case modelMissing
     case processFailed(Int32)
+    case archiveFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -291,8 +339,9 @@ enum TranscriberError: LocalizedError {
         case .runtimeMissing: return "The bundled transcription runtime is missing. Reinstall the app."
         case .mediaRuntimeMissing: return "The bundled media decoder is missing. Reinstall the app."
         case .runtimeIncompatible: return "The bundled transcription engine and its runtime policy are incompatible. Reinstall or update the app."
-        case .modelMissing: return "The large-v3 model is not installed."
+        case .modelMissing: return "The selected transcription model is not installed."
         case .processFailed(let code): return "The transcription engine exited with status \(code)."
+        case .archiveFailed(let detail): return "Could not create the result ZIP: \(detail)"
         }
     }
 }
@@ -311,7 +360,10 @@ final class TranscriberModel: ObservableObject {
     @Published var installStatus = "Model not installed"
     @Published var selectedLanguage = "en"
     @Published var optimizationText = "Automatic scheduling will adapt to this Mac and the queue."
-    @Published var engineProgress: Double?
+    @Published var queueProgress: Double?
+    @Published var activeProgress: Double?
+    @Published var queueCompletionText: String?
+    @Published var activeCompletionText: String?
 
     let hardware = HardwareProfile.current()
     private var processes: [UUID: Process] = [:]
@@ -607,10 +659,28 @@ final class TranscriberModel: ObservableObject {
         lastOutput = nil
         logText = "Transcription started. Detailed engine output is saved with each result."
         statusText = "Starting..."
-        startProgressMonitor()
+        jobProgress.reset()
+        queueProgress = nil
+        activeProgress = nil
+        queueCompletionText = nil
+        activeCompletionText = nil
         let queued = recordings
         transcriptionTask = Task {
             do {
+                let durations = try await probeDurations(queued)
+                var workIDs: [String: [URL: UUID]] = [:]
+                var workWeights: [UUID: Double] = [:]
+                for profile in profiles {
+                    var profileIDs: [URL: UUID] = [:]
+                    for recording in queued {
+                        let id = UUID()
+                        profileIDs[recording] = id
+                        workWeights[id] = durations[recording] ?? 1
+                    }
+                    workIDs[profile.id] = profileIDs
+                }
+                jobProgress.configure(workWeights)
+                startProgressMonitor()
                 primeCPUUtilization()
                 try await Task.sleep(nanoseconds: 250_000_000)
                 for (profileIndex, profile) in profiles.enumerated() {
@@ -624,10 +694,11 @@ final class TranscriberModel: ObservableObject {
 
                         while active < plan.concurrency && nextIndex < queued.count {
                             let recording = queued[nextIndex]
+                            let workID = workIDs[profile.id]![recording]!
                             let jobPlan = plan
                             nextIndex += 1
                             active += 1
-                            group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark) }
+                            group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID) }
                         }
 
                         let initialPrefix = benchmark ? "Bench \(profileIndex + 1)/\(profiles.count) · \(profile.name) · " : ""
@@ -645,10 +716,11 @@ final class TranscriberModel: ObservableObject {
                             optimizationText = plan.reason
                             while active < plan.concurrency && nextIndex < queued.count {
                                 let recording = queued[nextIndex]
+                                let workID = workIDs[profile.id]![recording]!
                                 let jobPlan = plan
                                 nextIndex += 1
                                 active += 1
-                                group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark) }
+                                group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID) }
                             }
 
                             let prefix = benchmark ? "Bench \(profileIndex + 1)/\(profiles.count) · \(profile.name) · " : ""
@@ -689,26 +761,121 @@ final class TranscriberModel: ObservableObject {
 
     private func startProgressMonitor() {
         progressTask?.cancel()
-        jobProgress.reset()
-        engineProgress = nil
+        queueProgress = nil
+        activeProgress = nil
+        queueCompletionText = nil
+        activeCompletionText = nil
         progressTask = Task { @MainActor [weak self] in
+            var queueSamples: [(date: Date, fraction: Double)] = []
+            var activeSamples: [(date: Date, fraction: Double)] = []
+            var previousActiveIDs: Set<UUID> = []
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
-                guard !Task.isCancelled else { break }
-                self?.engineProgress = self?.jobProgress.average()
+                guard !Task.isCancelled, let self, let snapshot = self.jobProgress.snapshot() else { continue }
+                let now = Date()
+                self.queueProgress = snapshot.queue
+                self.activeProgress = snapshot.active
+
+                queueSamples.append((now, snapshot.queue))
+                queueSamples.removeAll { now.timeIntervalSince($0.date) > 30 }
+                self.queueCompletionText = Self.etaText(samples: queueSamples, fraction: snapshot.queue, now: now)
+
+                if snapshot.activeIDs != previousActiveIDs {
+                    activeSamples.removeAll(keepingCapacity: true)
+                    previousActiveIDs = snapshot.activeIDs
+                }
+                if let active = snapshot.active {
+                    activeSamples.append((now, active))
+                    activeSamples.removeAll { now.timeIntervalSince($0.date) > 20 }
+                    self.activeCompletionText = Self.etaText(samples: activeSamples, fraction: active, now: now)
+                } else {
+                    activeSamples.removeAll(keepingCapacity: true)
+                    self.activeCompletionText = nil
+                }
             }
         }
+    }
+
+    private static func etaText(samples: [(date: Date, fraction: Double)], fraction: Double, now: Date) -> String? {
+        guard let first = samples.first else { return nil }
+        let interval = now.timeIntervalSince(first.date)
+        let advanced = fraction - first.fraction
+        guard interval >= 3, advanced > 0.001, fraction < 0.999 else { return nil }
+        let remainingSeconds = (1 - fraction) / (advanced / interval)
+        guard remainingSeconds.isFinite, remainingSeconds > 0, remainingSeconds < 604_800 else { return nil }
+        let completion = now.addingTimeInterval(remainingSeconds)
+        return "ETA \(DateFormatter.localizedString(from: completion, dateStyle: .none, timeStyle: .short))"
     }
 
     private func stopProgressMonitor() {
         progressTask?.cancel()
         progressTask = nil
         jobProgress.reset()
-        engineProgress = nil
+        queueProgress = nil
+        activeProgress = nil
+        queueCompletionText = nil
+        activeCompletionText = nil
     }
 
-    private func transcribe(_ input: URL, plan: ExecutionPlan, profile: ModelProfile, benchmark: Bool) async throws -> URL {
+    private func probeDurations(_ inputs: [URL]) async throws -> [URL: Double] {
+        var discovered: [URL: Double] = [:]
+        for (index, input) in inputs.enumerated() {
+            try Task.checkCancellation()
+            statusText = "Analyzing media \(index + 1)/\(inputs.count)…"
+            if let duration = try await probeDuration(input), duration > 0 {
+                discovered[input] = duration
+            }
+        }
+        let known = discovered.values.sorted()
+        let fallback = known.isEmpty ? 1.0 : known[known.count / 2]
+        return Dictionary(uniqueKeysWithValues: inputs.map { ($0, discovered[$0] ?? fallback) })
+    }
+
+    private func probeDuration(_ input: URL) async throws -> Double? {
         let jobID = UUID()
+        let collector = LockedText()
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = bundledFFmpeg
+        task.arguments = ["-nostdin", "-hide_banner", "-i", input.path]
+        task.standardOutput = pipe
+        task.standardError = pipe
+        processes[jobID] = task
+        defer {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            processes.removeValue(forKey: jobID)
+        }
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            collector.append(text)
+        }
+        _ = try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                task.terminationHandler = { completed in
+                    pipe.fileHandleForReading.readabilityHandler = nil
+                    continuation.resume(returning: completed.terminationStatus)
+                }
+                do { try task.run() } catch { continuation.resume(throwing: error) }
+            }
+        }, onCancel: {
+            if task.isRunning { task.terminate() }
+        })
+        if Task.isCancelled { throw CancellationError() }
+        let output = collector.snapshot() as NSString
+        let pattern = #"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.firstMatch(in: output as String, range: NSRange(location: 0, length: output.length)),
+              match.numberOfRanges == 4,
+              let hours = Double(output.substring(with: match.range(at: 1))),
+              let minutes = Double(output.substring(with: match.range(at: 2))),
+              let seconds = Double(output.substring(with: match.range(at: 3))) else { return nil }
+        return hours * 3600 + minutes * 60 + seconds
+    }
+
+    private func transcribe(_ input: URL, plan: ExecutionPlan, profile: ModelProfile, benchmark: Bool, jobID: UUID) async throws -> URL {
+        jobProgress.activate(jobID)
+        defer { jobProgress.deactivate(jobID) }
         let fileManager = FileManager.default
         let inputDirectory = input.deletingLastPathComponent()
         let stem = input.deletingPathExtension().lastPathComponent
@@ -728,8 +895,9 @@ final class TranscriberModel: ObservableObject {
 
         appendLog("\nTranscribing: \(input.lastPathComponent)\nStep 1/2: extracting the first audio stream...\n")
         let mediaLog = try await runFFmpeg(input: input, output: wav, jobID: jobID)
+        jobProgress.extractionCompleted(jobID)
         try Task.checkCancellation()
-        appendLog("Step 2/2: running bundled large-v3...\n\n")
+        appendLog("Step 2/2: running \(profile.name) with the bundled engine...\n\n")
 
         let started = Date()
         let engineLog = try await runWhisper(wav: wav, outputStem: outputStem, plan: plan, profile: profile, jobID: jobID)
@@ -756,12 +924,18 @@ final class TranscriberModel: ObservableObject {
         - Effective arguments: `\(resolvedWhisperArguments(wav: wav, outputStem: outputStem, profile: profile, threads: plan.threadsPerFile).joined(separator: " "))`
         - Engine environment: `\(RuntimePolicy.bundled.environment.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "))`
         - Scheduler: \(plan.concurrency) Metal inference worker(s); concurrency and CPU helper threads selected from the model, performance cores, GPU/CPU load, memory, power, and thermal state
+        - Result archive: `\(outputDirectory.appendingPathExtension("zip").path)`
         - Temporary PCM: deleted
         - Media decoder: bundled FFmpeg (first audio stream)
         """
         try metadata.write(to: outputDirectory.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
         try mediaLog.write(to: outputDirectory.appendingPathComponent("media.log"), atomically: true, encoding: .utf8)
+        let archive = outputDirectory.appendingPathExtension("zip")
+        appendLog("Packaging: \(archive.lastPathComponent)\n")
+        try await runArchiver(directory: outputDirectory, archive: archive, jobID: jobID)
+        jobProgress.complete(jobID)
         appendLog("\nCompleted: \(outputDirectory.appendingPathComponent("transcript.txt").path)\n")
+        appendLog("Archive: \(archive.path)\n")
         return outputDirectory
     }
 
@@ -803,6 +977,45 @@ final class TranscriberModel: ObservableObject {
         return collector.snapshot()
     }
 
+    private func runArchiver(directory: URL, archive: URL, jobID: UUID) async throws {
+        let collector = LockedText()
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        task.arguments = ["-c", "-k", "--norsrc", "--noextattr", "--noacl", "--keepParent", directory.path, archive.path]
+        task.standardOutput = pipe
+        task.standardError = pipe
+        processes[jobID] = task
+        var succeeded = false
+        defer {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            processes.removeValue(forKey: jobID)
+            if !succeeded { try? FileManager.default.removeItem(at: archive) }
+        }
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            collector.append(text)
+        }
+        let status: Int32 = try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                task.terminationHandler = { completed in
+                    pipe.fileHandleForReading.readabilityHandler = nil
+                    continuation.resume(returning: completed.terminationStatus)
+                }
+                do { try task.run() } catch { continuation.resume(throwing: error) }
+            }
+        }, onCancel: {
+            if task.isRunning { task.terminate() }
+        })
+        if Task.isCancelled { throw CancellationError() }
+        guard status == 0, FileManager.default.fileExists(atPath: archive.path) else {
+            let detail = collector.snapshot().trimmingCharacters(in: .whitespacesAndNewlines)
+            throw TranscriberError.archiveFailed(detail.isEmpty ? "ditto exited with status \(status)" : detail)
+        }
+        succeeded = true
+    }
+
     private func runWhisper(wav: URL, outputStem: URL, plan: ExecutionPlan, profile: ModelProfile, jobID: UUID) async throws -> String {
         let activeModelURL = modelURL(for: profile)
         guard FileManager.default.fileExists(atPath: activeModelURL.path) else { throw TranscriberError.modelMissing }
@@ -816,9 +1029,9 @@ final class TranscriberModel: ObservableObject {
         let runtimeEnvironment = RuntimePolicy.bundled.environment.merging(["DYLD_LIBRARY_PATH": bundledRuntime.path]) { _, new in new }
         task.environment = ProcessInfo.processInfo.environment.merging(runtimeEnvironment) { _, new in new }
         processes[jobID] = task
-        jobProgress.begin(jobID)
+        jobProgress.beginEngine(jobID)
         defer {
-            jobProgress.end(jobID)
+            jobProgress.endEngine(jobID)
             processes.removeValue(forKey: jobID)
         }
         let progress = jobProgress
@@ -857,13 +1070,24 @@ final class TranscriberModel: ObservableObject {
     }
 
     private func makeConcurrencyCeiling(profile: ModelProfile) -> Int {
-        guard profile.id == ModelProfile.balanced.id,
-              Self.availableMemoryGiB() >= 7.0,
-              !ProcessInfo.processInfo.isLowPowerModeEnabled,
+        let availableGiB = Self.availableMemoryGiB()
+        guard !ProcessInfo.processInfo.isLowPowerModeEnabled,
               ProcessInfo.processInfo.thermalState != .serious,
               ProcessInfo.processInfo.thermalState != .critical else { return 1 }
-        guard let gpu = Self.gpuUtilization(), gpu < 0.50 else { return 1 }
-        return 2
+        let gpu = Self.gpuUtilization()
+        switch profile.id {
+        case ModelProfile.balanced.id:
+            guard availableGiB >= 7.0, let gpu, gpu < 0.50 else { return 1 }
+            return 2
+        case ModelProfile.compact.id:
+            let hardwareCeiling = hardware.performanceCores >= 8 ? 3 : (hardware.performanceCores >= 4 ? 2 : 1)
+            guard hardwareCeiling > 1,
+                  availableGiB >= 2.0 + (1.5 * Double(hardwareCeiling)),
+                  let gpu, gpu < 0.70 else { return 1 }
+            return hardwareCeiling
+        default:
+            return 1
+        }
     }
 
     private func makeExecutionPlan(remainingFiles: Int, profile: ModelProfile, concurrencyCeiling: Int) -> ExecutionPlan {
@@ -891,7 +1115,7 @@ final class TranscriberModel: ObservableObject {
         } else if !memorySafe {
             state = "low memory headroom; serial GPU mode"
         } else if concurrency > 1 {
-            state = "dual workers validated for this model"
+            state = "adaptive parallel Metal mode"
         } else {
             state = "serial Metal mode avoids GPU contention"
         }
@@ -1194,6 +1418,24 @@ struct TranscribeView: View {
     @ObservedObject var model: TranscriberModel
     let openModels: () -> Void
 
+    @ViewBuilder
+    private func progressRow(_ label: String, progress: Double?, eta: String?) -> some View {
+        HStack(spacing: 7) {
+            Text(label).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
+            if let progress {
+                ProgressView(value: progress).frame(width: 115)
+                Text("\(Int(progress * 100))%")
+                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                    .frame(width: 32, alignment: .trailing)
+            } else {
+                ProgressView().controlSize(.small).frame(width: 154)
+            }
+            Text(eta ?? "Estimating…")
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                .frame(width: 92, alignment: .leading)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -1223,11 +1465,9 @@ struct TranscribeView: View {
                 Button("Clear Queue") { model.clear() }.disabled(model.isRunning || model.recordings.isEmpty)
                 Spacer()
                 if model.isRunning {
-                    if let progress = model.engineProgress {
-                        ProgressView(value: progress).frame(width: 110)
-                        Text("\(Int(progress * 100))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    } else {
-                        ProgressView().controlSize(.small)
+                    VStack(alignment: .trailing, spacing: 3) {
+                        progressRow("Active", progress: model.activeProgress, eta: model.activeCompletionText)
+                        progressRow("Queue", progress: model.queueProgress, eta: model.queueCompletionText)
                     }
                     Button("Cancel") { model.cancel() }
                 } else {
@@ -1265,7 +1505,7 @@ struct TranscribeView: View {
                 }.frame(minHeight: 115)
             }
             HStack {
-                Text("Each result is saved beside its source; temporary extracted audio is deleted.")
+                Text("Each result folder and its ZIP archive are saved beside the source; temporary extracted audio is deleted.")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Reveal Last Output") { model.revealOutput() }.disabled(model.lastOutput == nil)

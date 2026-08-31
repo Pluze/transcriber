@@ -11,17 +11,21 @@ receive TXT, SRT, full JSON, logs, and run metadata beside the source file.
 - Models are installed, verified, located, and removed from the Models tab.
 - Existing models from Lecture Transcriber are detected and imported without
   modifying or deleting the old copy.
-- Active inference progress is shown without streaming the engine's verbose log
-  into the UI; full diagnostic output remains in each result directory.
+- Active workers and the full queue have separate progress bars and rolling ETA
+  estimates. Queue progress is duration-weighted and never moves backward.
+- Each result is saved both as a readable folder and a same-named ZIP archive.
+- Engine progress is parsed without streaming the verbose log into the UI; full
+  diagnostic output remains in each result directory.
 - Temporary 16 kHz mono PCM is deleted after every run.
 
 The default `Maximum Fidelity` model prioritizes recognition quality. The app
 uses the Mac's performance-core count and probes CPU load, Metal GPU activity,
 available memory, power mode, and thermal state before scheduling work. On the
-reference M5 hardware, Maximum Fidelity and Compact use one Metal worker to
-avoid GPU contention; Balanced may use two only when GPU and memory headroom
-allow it. Beam/context settings remain fixed so scheduling does not silently
-change transcript quality.
+reference M5 hardware, Maximum Fidelity remains serial, Balanced may use two
+Metal workers, and Compact may use two. Compact can use three on Macs with at
+least eight performance cores. Parallelism is admitted only when GPU, memory,
+CPU, power, and thermal headroom allow it. Beam/context settings remain fixed
+so scheduling does not silently change transcript quality.
 
 Install two or more models to enable **Bench Installed Models**, which runs the
 whole queue through every installed model with the same runtime policy.
@@ -60,7 +64,8 @@ keychain profile.
 ## Runtime storage
 
 Models live in `~/Library/Application Support/Transcriber/models`. Outputs are
-created beside their source files in a new `<name>.transcript` directory.
+created beside their source files as a `<name>.transcript` directory and a
+matching `<name>.transcript.zip` archive.
 
 ## Third-party components
 

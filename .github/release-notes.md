@@ -1,5 +1,16 @@
 ## Install on macOS
 
+### v1.2.2
+
+- Runs two Compact files concurrently on the reference M5 when live GPU,
+  memory, CPU, power, and thermal checks permit it; higher-core Macs may use
+  three workers.
+- Separates Active and Queue progress. Each has its own rolling ETA, while total
+  queue progress is duration-weighted and monotonic across parallel work.
+- Produces a same-named ZIP next to every transcript result folder.
+- Preserves the fixed beam/context decoding policy across all concurrency
+  choices, so scheduling changes throughput rather than recognition settings.
+
 ### v1.2.1
 
 - Shows live inference percentage so long recordings no longer appear stuck at
