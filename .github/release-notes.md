@@ -10,6 +10,8 @@
 - Produces a same-named ZIP next to every transcript result folder.
 - Preserves the fixed beam/context decoding policy across all concurrency
   choices, so scheduling changes throughput rather than recognition settings.
+- Rechecks pending queues every two seconds, preventing a long active recording
+  from blocking short queued files after a temporary concurrency reduction.
 
 ### v1.2.1
 

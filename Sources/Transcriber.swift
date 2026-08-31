@@ -114,6 +114,11 @@ struct ExecutionPlan: Sendable {
     let reason: String
 }
 
+private enum SchedulerEvent: Sendable {
+    case completed(URL)
+    case reevaluate
+}
+
 struct RuntimePolicy: Codable {
     let engine: String
     let policyVersion: Int
@@ -688,9 +693,10 @@ final class TranscriberModel: ObservableObject {
                     var completed = 0
                     var active = 0
                     let concurrencyCeiling = makeConcurrencyCeiling(profile: profile)
-                    try await withThrowingTaskGroup(of: URL.self) { group in
+                    try await withThrowingTaskGroup(of: SchedulerEvent.self) { group in
                         var plan = makeExecutionPlan(remainingFiles: queued.count, profile: profile, concurrencyCeiling: concurrencyCeiling)
                         optimizationText = plan.reason
+                        var reevaluationPending = false
 
                         while active < plan.concurrency && nextIndex < queued.count {
                             let recording = queued[nextIndex]
@@ -698,20 +704,34 @@ final class TranscriberModel: ObservableObject {
                             let jobPlan = plan
                             nextIndex += 1
                             active += 1
-                            group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID) }
+                            group.addTask {
+                                .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID))
+                            }
+                        }
+                        if nextIndex < queued.count {
+                            reevaluationPending = true
+                            group.addTask {
+                                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                return .reevaluate
+                            }
                         }
 
                         let initialPrefix = benchmark ? "Bench \(profileIndex + 1)/\(profiles.count) · \(profile.name) · " : ""
                         statusText = "\(initialPrefix)0/\(queued.count) complete · \(active) active"
 
-                        while let output = try await group.next() {
-                            active -= 1
-                            completed += 1
-                            lastOutput = output.appendingPathComponent("transcript.txt")
+                        while completed < queued.count, let event = try await group.next() {
+                            switch event {
+                            case .completed(let output):
+                                active -= 1
+                                completed += 1
+                                lastOutput = output.appendingPathComponent("transcript.txt")
+                            case .reevaluate:
+                                reevaluationPending = false
+                            }
                             try Task.checkCancellation()
 
                             let remaining = queued.count - completed
-                            guard remaining > 0 else { continue }
+                            guard remaining > 0 else { break }
                             plan = makeExecutionPlan(remainingFiles: remaining, profile: profile, concurrencyCeiling: concurrencyCeiling)
                             optimizationText = plan.reason
                             while active < plan.concurrency && nextIndex < queued.count {
@@ -720,12 +740,22 @@ final class TranscriberModel: ObservableObject {
                                 let jobPlan = plan
                                 nextIndex += 1
                                 active += 1
-                                group.addTask { try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID) }
+                                group.addTask {
+                                    .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID))
+                                }
+                            }
+                            if nextIndex < queued.count && !reevaluationPending {
+                                reevaluationPending = true
+                                group.addTask {
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    return .reevaluate
+                                }
                             }
 
                             let prefix = benchmark ? "Bench \(profileIndex + 1)/\(profiles.count) · \(profile.name) · " : ""
                             statusText = "\(prefix)\(completed)/\(queued.count) complete · \(active) active"
                         }
+                        group.cancelAll()
                     }
                 }
                 statusText = benchmark ? "Benchmark completed" : "Completed"

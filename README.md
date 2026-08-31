@@ -25,7 +25,9 @@ reference M5 hardware, Maximum Fidelity remains serial, Balanced may use two
 Metal workers, and Compact may use two. Compact can use three on Macs with at
 least eight performance cores. Parallelism is admitted only when GPU, memory,
 CPU, power, and thermal headroom allow it. Beam/context settings remain fixed
-so scheduling does not silently change transcript quality.
+so scheduling does not silently change transcript quality. While files remain
+pending, the scheduler reevaluates every two seconds, allowing a temporarily
+reduced worker slot to recover without waiting for a long active file to finish.
 
 Install two or more models to enable **Bench Installed Models**, which runs the
 whole queue through every installed model with the same runtime policy.
