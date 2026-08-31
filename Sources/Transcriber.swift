@@ -77,9 +77,9 @@ struct HardwareProfile {
 
     var recommendation: String {
         if memoryGiB >= 16 && logicalCores >= 8 {
-            return "Maximum Fidelity"
+            return "Maximum Fidelity for accuracy; Balanced and Compact are much faster and offer excellent value"
         }
-        return "Maximum Fidelity (expect slower processing)"
+        return "Compact by default; Balanced adds fidelity, while Maximum Fidelity will be slower"
     }
 
     var recommendedProfileID: String {
@@ -359,7 +359,7 @@ final class TranscriberModel: ObservableObject {
     @Published var isRunning = false
     @Published var lastOutput: URL?
     @Published var modelInstalled = false
-    @Published var selectedProfileID = ModelProfile.maximum.id
+    @Published var selectedProfileID = ModelProfile.compact.id
     @Published var isInstalling = false
     @Published var installProgress = 0.0
     @Published var installStatus = "Model not installed"
@@ -384,7 +384,7 @@ final class TranscriberModel: ObservableObject {
     }
 
     var selectedProfile: ModelProfile {
-        ModelProfile.all.first(where: { $0.id == selectedProfileID }) ?? .maximum
+        ModelProfile.all.first(where: { $0.id == selectedProfileID }) ?? .compact
     }
 
     func modelURL(for profile: ModelProfile) -> URL {
@@ -425,7 +425,7 @@ final class TranscriberModel: ObservableObject {
     }
 
     init() {
-        selectedProfileID = hardware.recommendedProfileID
+        selectedProfileID = ModelProfile.compact.id
         refreshInstallationState()
     }
 
@@ -1306,12 +1306,19 @@ struct SetupCard: View {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(model.selectedProfile.name).font(.subheadline.weight(.semibold))
-                        if model.selectedProfile.id == model.hardware.recommendedProfileID {
-                            Text("RECOMMENDED")
+                        if model.selectedProfile.id == ModelProfile.compact.id {
+                            Text("DEFAULT")
                                 .font(.system(size: 9, weight: .bold))
                                 .padding(.horizontal, 6).padding(.vertical, 2)
                                 .background(Capsule().fill(Color.accentColor.opacity(0.15)))
                                 .foregroundStyle(Color.accentColor)
+                        }
+                        if model.selectedProfile.id == model.hardware.recommendedProfileID {
+                            Text("ACCURACY PICK")
+                                .font(.system(size: 9, weight: .bold))
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Capsule().fill(Color.secondary.opacity(0.14)))
+                                .foregroundStyle(.secondary)
                         }
                         if model.profileIsInstalled(model.selectedProfile) {
                             Label("Installed", systemImage: "checkmark.circle.fill")
@@ -1550,7 +1557,7 @@ struct ModelsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 15) {
                 Text("Performance & Models").font(.title2.bold())
-                Text("Choose recognition capability first. Transcriber recommends the highest-fidelity profile suitable for this Mac.")
+                Text("Compact is the fast everyday default. Maximum Fidelity is the accuracy pick when time matters less; Balanced offers a strong speed-to-quality tradeoff.")
                     .foregroundStyle(.secondary)
                 HardwareCard(profile: model.hardware)
                 SetupCard(model: model)

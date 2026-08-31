@@ -18,7 +18,9 @@ receive TXT, SRT, full JSON, logs, and run metadata beside the source file.
   diagnostic output remains in each result directory.
 - Temporary 16 kHz mono PCM is deleted after every run.
 
-The default `Maximum Fidelity` model prioritizes recognition quality. The app
+The default `Compact` model prioritizes fast everyday transcription and low
+storage use. `Maximum Fidelity` remains the accuracy pick when processing time
+matters less, while `Balanced` offers a strong speed-to-quality tradeoff. The app
 uses the Mac's performance-core count and probes CPU load, Metal GPU activity,
 available memory, power mode, and thermal state before scheduling work. On the
 reference M5 hardware, Maximum Fidelity remains serial, Balanced may use two
