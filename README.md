@@ -11,6 +11,8 @@ receive TXT, SRT, full JSON, logs, and run metadata beside the source file.
 - Models are installed, verified, located, and removed from the Models tab.
 - Existing models from Lecture Transcriber are detected and imported without
   modifying or deleting the old copy.
+- Active inference progress is shown without streaming the engine's verbose log
+  into the UI; full diagnostic output remains in each result directory.
 - Temporary 16 kHz mono PCM is deleted after every run.
 
 The default `Maximum Fidelity` model prioritizes recognition quality. The app

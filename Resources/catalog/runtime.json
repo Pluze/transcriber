@@ -1,6 +1,6 @@
 {
   "engine": "whisper.cpp",
-  "policyVersion": 2,
+  "policyVersion": 3,
   "compatibleVersionContains": "1.9.1",
   "environment": {},
   "arguments": [
@@ -13,6 +13,7 @@
     "--beam-size", "5",
     "--best-of", "5",
     "--max-context", "0",
+    "--print-progress",
     "--output-txt",
     "--output-srt",
     "--output-json-full",

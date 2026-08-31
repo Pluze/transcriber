@@ -210,6 +210,55 @@ final class LockedText: @unchecked Sendable {
     }
 }
 
+final class JobProgressStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [UUID: Double] = [:]
+    private var tails: [UUID: String] = [:]
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        values.removeAll(keepingCapacity: true)
+        tails.removeAll(keepingCapacity: true)
+    }
+
+    func begin(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        values[id] = 0
+        tails[id] = ""
+    }
+
+    func ingest(_ text: String, for id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        let combined = (tails[id] ?? "") + text
+        var best = values[id] ?? 0
+        for part in combined.components(separatedBy: "progress =").dropFirst() {
+            let digits = part.drop(while: { $0 == " " || $0 == "\t" }).prefix(while: { $0.isNumber })
+            if let percent = Double(digits) {
+                best = max(best, min(1, percent / 100))
+            }
+        }
+        values[id] = best
+        tails[id] = String(combined.suffix(128))
+    }
+
+    func end(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        values.removeValue(forKey: id)
+        tails.removeValue(forKey: id)
+    }
+
+    func average() -> Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !values.isEmpty else { return nil }
+        return values.values.reduce(0, +) / Double(values.count)
+    }
+}
+
 private struct CPUTickSnapshot {
     let user: UInt64
     let system: UInt64
@@ -262,12 +311,15 @@ final class TranscriberModel: ObservableObject {
     @Published var installStatus = "Model not installed"
     @Published var selectedLanguage = "en"
     @Published var optimizationText = "Automatic scheduling will adapt to this Mac and the queue."
+    @Published var engineProgress: Double?
 
     let hardware = HardwareProfile.current()
     private var processes: [UUID: Process] = [:]
     private var transcriptionTask: Task<Void, Never>?
     private var downloader: ModelDownloader?
     private var previousCPUTicks: CPUTickSnapshot?
+    private let jobProgress = JobProgressStore()
+    private var progressTask: Task<Void, Never>?
 
     var applicationSupport: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -555,6 +607,7 @@ final class TranscriberModel: ObservableObject {
         lastOutput = nil
         logText = "Transcription started. Detailed engine output is saved with each result."
         statusText = "Starting..."
+        startProgressMonitor()
         let queued = recordings
         transcriptionTask = Task {
             do {
@@ -612,6 +665,7 @@ final class TranscriberModel: ObservableObject {
                 appendLog("\nERROR: \(error.localizedDescription)\n")
             }
             isRunning = false
+            stopProgressMonitor()
             processes.removeAll()
             transcriptionTask = nil
         }
@@ -631,6 +685,26 @@ final class TranscriberModel: ObservableObject {
     private func appendLog(_ text: String) {
         logText += text
         if logText.count > 12_000 { logText.removeFirst(logText.count - 12_000) }
+    }
+
+    private func startProgressMonitor() {
+        progressTask?.cancel()
+        jobProgress.reset()
+        engineProgress = nil
+        progressTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled else { break }
+                self?.engineProgress = self?.jobProgress.average()
+            }
+        }
+    }
+
+    private func stopProgressMonitor() {
+        progressTask?.cancel()
+        progressTask = nil
+        jobProgress.reset()
+        engineProgress = nil
     }
 
     private func transcribe(_ input: URL, plan: ExecutionPlan, profile: ModelProfile, benchmark: Bool) async throws -> URL {
@@ -742,10 +816,17 @@ final class TranscriberModel: ObservableObject {
         let runtimeEnvironment = RuntimePolicy.bundled.environment.merging(["DYLD_LIBRARY_PATH": bundledRuntime.path]) { _, new in new }
         task.environment = ProcessInfo.processInfo.environment.merging(runtimeEnvironment) { _, new in new }
         processes[jobID] = task
+        jobProgress.begin(jobID)
+        defer {
+            jobProgress.end(jobID)
+            processes.removeValue(forKey: jobID)
+        }
+        let progress = jobProgress
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             collector.append(text)
+            progress.ingest(text, for: jobID)
         }
 
         let status: Int32 = try await withTaskCancellationHandler(operation: {
@@ -759,7 +840,6 @@ final class TranscriberModel: ObservableObject {
         }, onCancel: {
             if task.isRunning { task.terminate() }
         })
-        processes.removeValue(forKey: jobID)
         if Task.isCancelled { throw CancellationError() }
         guard status == 0 else { throw TranscriberError.processFailed(status) }
         return collector.snapshot()
@@ -1134,7 +1214,12 @@ struct TranscribeView: View {
                 Button("Clear Queue") { model.clear() }.disabled(model.isRunning || model.recordings.isEmpty)
                 Spacer()
                 if model.isRunning {
-                    ProgressView().controlSize(.small)
+                    if let progress = model.engineProgress {
+                        ProgressView(value: progress).frame(width: 110)
+                        Text("\(Int(progress * 100))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
                     Button("Cancel") { model.cancel() }
                 } else {
                     Button("Bench Installed Models") { model.startBenchmark() }
