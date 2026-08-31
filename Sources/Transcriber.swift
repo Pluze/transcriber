@@ -1153,12 +1153,21 @@ struct ContentView: View {
     @ObservedObject var model: TranscriberModel
     @State private var selectedTab = 0
 
+    private var versionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        return "Version \(version) (\(build))"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Image(systemName: "waveform.and.mic").font(.title2).foregroundStyle(Color.accentColor)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Transcriber").font(.title2.bold())
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("Transcriber").font(.title2.bold())
+                        Text(versionText).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+                    }
                     Text("Private, local, high-fidelity transcription").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()

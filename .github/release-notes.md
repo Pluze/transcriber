@@ -7,6 +7,7 @@
 - Keeps verbose engine output out of the main UI, preserving the low GUI CPU
   usage introduced in v1.2.0.
 - Cleans up per-job progress state on cancellation or launch failure.
+- Displays the installed release version and build number in the main window.
 
 Download the App ZIP, unzip it, and drag `Transcriber.app` to Applications.
 
