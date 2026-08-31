@@ -1,5 +1,16 @@
 ## Install on macOS
 
+### v1.2.3
+
+- Makes Compact the default model for fast everyday transcription, small
+  downloads, and low storage use.
+- Keeps Maximum Fidelity as the accuracy-first choice on capable Macs while
+  making its processing-time tradeoff explicit.
+- Clarifies that Balanced and Compact offer substantial speed advantages and
+  strong speed-to-quality value.
+- Preserves the stable decoding policy used by v1.2.2 across every model and
+  benchmark run.
+
 ### v1.2.2
 
 - Runs two Compact files concurrently on the reference M5 when live GPU,
