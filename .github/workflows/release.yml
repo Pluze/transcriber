@@ -36,5 +36,5 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
             release-inputs/Transcriber-*-macOS-arm64.zip \
             release-inputs/FFmpeg-9.0.1-source.tar.xz \
-            --title "Transcriber ${GITHUB_REF_NAME#v}" \
+            --title "$GITHUB_REF_NAME" \
             --notes-file "$NOTES_FILE" --verify-tag
