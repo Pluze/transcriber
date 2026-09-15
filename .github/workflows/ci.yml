@@ -25,6 +25,7 @@ jobs:
           codesign --verify --deep --strict Transcriber.app
           test -x Transcriber.app/Contents/Resources/runtime/bin/ffmpeg
           test -x Transcriber.app/Contents/Resources/runtime/bin/whisper-cli
+          test -d Transcriber.app/Contents/Resources/FluidAudio_FluidAudio.bundle
           ZIP="$(find dist -maxdepth 1 -name 'Transcriber-*-macOS-arm64.zip' -print -quit)"
           test -n "$ZIP"
           test "$(zipinfo -1 "$ZIP" | awk -F/ 'length { print $1 }' | sort -u)" = "Transcriber.app"

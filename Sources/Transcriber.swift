@@ -1,6 +1,8 @@
 import AppKit
+@preconcurrency import CoreML
 import CryptoKit
 import Darwin
+import FluidAudio
 import IOKit
 import SwiftUI
 import UniformTypeIdentifiers
@@ -47,6 +49,70 @@ struct LanguageOption: Identifiable, Hashable, Codable {
         }
         return [LanguageOption(code: "auto", name: "Auto — dominant language")] + languages
     }()
+}
+
+enum SpeakerMode: Hashable, Sendable {
+    case disabled
+    case automatic
+    case exact(Int)
+
+    static let options: [SpeakerMode] = [.disabled, .automatic] + (2...30).map { .exact($0) }
+
+    var id: String {
+        switch self {
+        case .disabled: return "disabled"
+        case .automatic: return "automatic"
+        case .exact(let count): return "exact-\(count)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .disabled: return "Do not distinguish speakers"
+        case .automatic: return "Distinguish speakers automatically"
+        case .exact(let count): return "Specify \(count) speakers"
+        }
+    }
+
+    var requestedCount: Int? {
+        if case .exact(let count) = self { return count }
+        return nil
+    }
+
+    var isEnabled: Bool { self != .disabled }
+}
+
+private struct DiarizationSegment: Codable {
+    let speaker: String
+    let start: Double
+    let end: Double
+}
+
+private struct DiarizationPayload: Codable {
+    let requestedSpeakers: Int?
+    let detectedSpeakers: Int
+    let segments: [DiarizationSegment]
+}
+
+private struct SpeakerTurn: Codable {
+    let speaker: String
+    let start: Double
+    let end: Double
+    let text: String
+}
+
+private struct SpeakerTranscript: Codable {
+    let mode: String
+    let requestedSpeakers: Int?
+    let detectedSpeakers: Int
+    let turns: [SpeakerTurn]
+}
+
+private struct SpeakerTimeline: Codable {
+    let mode: String
+    let requestedSpeakers: Int?
+    let detectedSpeakers: Int
+    let segments: [DiarizationSegment]
 }
 
 extension Notification.Name {
@@ -104,7 +170,8 @@ struct HardwareProfile {
         guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
         var value = [CChar](repeating: 0, count: size)
         guard sysctlbyname(name, &value, &size, nil, 0) == 0 else { return nil }
-        return String(cString: value)
+        let bytes = value.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
@@ -117,6 +184,27 @@ struct ExecutionPlan: Sendable {
 private enum SchedulerEvent: Sendable {
     case completed(URL)
     case reevaluate
+}
+
+private actor DiarizationGate {
+    private var occupied = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        if !occupied {
+            occupied = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func leave() {
+        if waiters.isEmpty {
+            occupied = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
 }
 
 struct RuntimePolicy: Codable {
@@ -147,7 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-final class ModelDownloader: NSObject, URLSessionDownloadDelegate {
+final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     var progressHandler: ((Double) -> Void)?
     var completionHandler: ((Result<URL, Error>) -> Void)?
     private var stableDownload: URL?
@@ -221,6 +309,7 @@ final class JobProgressStore: @unchecked Sendable {
     private var values: [UUID: Double] = [:]
     private var tails: [UUID: String] = [:]
     private var active: Set<UUID> = []
+    private var diarizationEnabled = false
 
     func reset() {
         lock.lock()
@@ -231,13 +320,14 @@ final class JobProgressStore: @unchecked Sendable {
         active.removeAll(keepingCapacity: true)
     }
 
-    func configure(_ units: [UUID: Double]) {
+    func configure(_ units: [UUID: Double], diarizationEnabled: Bool) {
         lock.lock()
         defer { lock.unlock() }
         weights = units.mapValues { max(0.001, $0) }
         values = Dictionary(uniqueKeysWithValues: units.keys.map { ($0, 0) })
         tails.removeAll(keepingCapacity: true)
         active.removeAll(keepingCapacity: true)
+        self.diarizationEnabled = diarizationEnabled
     }
 
     func activate(_ id: UUID) {
@@ -273,11 +363,26 @@ final class JobProgressStore: @unchecked Sendable {
         for part in combined.components(separatedBy: "progress =").dropFirst() {
             let digits = part.drop(while: { $0 == " " || $0 == "\t" }).prefix(while: { $0.isNumber })
             if let percent = Double(digits) {
-                best = max(best, min(0.99, 0.02 + (0.97 * percent / 100)))
+                let engineShare = diarizationEnabled ? 0.88 : 0.97
+                let ceiling = diarizationEnabled ? 0.90 : 0.99
+                best = max(best, min(ceiling, 0.02 + (engineShare * percent / 100)))
             }
         }
         values[id] = best
         tails[id] = String(combined.suffix(128))
+    }
+
+    func transcriptionCompleted(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        values[id] = max(values[id] ?? 0, diarizationEnabled ? 0.90 : 0.99)
+    }
+
+    func diarizationProgress(_ id: UUID, percent: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        let fraction = min(1, max(0, percent / 100))
+        values[id] = max(values[id] ?? 0, 0.90 + (0.09 * fraction))
     }
 
     func endEngine(_ id: UUID) {
@@ -333,6 +438,8 @@ enum TranscriberError: LocalizedError {
     case modelMissing
     case processFailed(Int32)
     case archiveFailed(String)
+    case invalidDiarizationOutput
+    case diarizationModelsMissing
 
     var errorDescription: String? {
         switch self {
@@ -347,6 +454,8 @@ enum TranscriberError: LocalizedError {
         case .modelMissing: return "The selected transcription model is not installed."
         case .processFailed(let code): return "The transcription engine exited with status \(code)."
         case .archiveFailed(let detail): return "Could not create the result ZIP: \(detail)"
+        case .invalidDiarizationOutput: return "Speaker diarization completed without a usable result."
+        case .diarizationModelsMissing: return "The bundled speaker diarization models are missing or invalid. Reinstall the app."
         }
     }
 }
@@ -364,6 +473,7 @@ final class TranscriberModel: ObservableObject {
     @Published var installProgress = 0.0
     @Published var installStatus = "Model not installed"
     @Published var selectedLanguage = "en"
+    @Published var selectedSpeakerMode: SpeakerMode = .disabled
     @Published var optimizationText = "Automatic scheduling will adapt to this Mac and the queue."
     @Published var queueProgress: Double?
     @Published var activeProgress: Double?
@@ -376,6 +486,7 @@ final class TranscriberModel: ObservableObject {
     private var downloader: ModelDownloader?
     private var previousCPUTicks: CPUTickSnapshot?
     private let jobProgress = JobProgressStore()
+    private let diarizationGate = DiarizationGate()
     private var progressTask: Task<Void, Never>?
 
     var applicationSupport: URL {
@@ -397,6 +508,12 @@ final class TranscriberModel: ObservableObject {
 
     var installedModelURL: URL {
         modelURL(for: selectedProfile)
+    }
+
+    var diarizationModelsURL: URL {
+        Bundle.main.resourceURL!
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("speaker-diarization", isDirectory: true)
     }
 
     var checksumMarkerURL: URL {
@@ -450,6 +567,20 @@ final class TranscriberModel: ObservableObject {
             return total + ((attributes?[.size] as? NSNumber)?.int64Value ?? 0)
         }
         return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    var diarizationStorageText: String {
+        ByteCountFormatter.string(fromByteCount: Self.directorySize(at: diarizationModelsURL), countStyle: .file)
+    }
+
+    var diarizationModelsInstalled: Bool {
+        diarizationModelsArePresent()
+    }
+
+    func diarizationModelsArePresent() -> Bool {
+        ModelNames.OfflineDiarizer.requiredModels.allSatisfy { name in
+            FileManager.default.fileExists(atPath: diarizationModelsURL.appendingPathComponent(name).path)
+        }
     }
 
     func refreshInstallationState() {
@@ -599,6 +730,70 @@ final class TranscriberModel: ObservableObject {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
+    nonisolated private static func directorySize(at url: URL) -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return 0 }
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else { continue }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
+    }
+
+    nonisolated private static func loadLocalDiarizationModels(from directory: URL) async throws -> OfflineDiarizerModels {
+        try await Task.detached(priority: .userInitiated) {
+            let started = Date()
+            let inferenceConfiguration = MLModelConfiguration()
+            inferenceConfiguration.computeUnits = .all
+            let fbankConfiguration = MLModelConfiguration()
+            fbankConfiguration.computeUnits = .cpuOnly
+
+            let segmentation = try MLModel(
+                contentsOf: directory.appendingPathComponent(ModelNames.OfflineDiarizer.segmentationPath),
+                configuration: inferenceConfiguration
+            )
+            let embedding = try MLModel(
+                contentsOf: directory.appendingPathComponent(ModelNames.OfflineDiarizer.embeddingPath),
+                configuration: inferenceConfiguration
+            )
+            let pldaRho = try MLModel(
+                contentsOf: directory.appendingPathComponent(ModelNames.OfflineDiarizer.pldaRhoPath),
+                configuration: inferenceConfiguration
+            )
+            let fbank = try MLModel(
+                contentsOf: directory.appendingPathComponent(ModelNames.OfflineDiarizer.fbankPath),
+                configuration: fbankConfiguration
+            )
+
+            let parametersURL = directory.appendingPathComponent(ModelNames.OfflineDiarizer.pldaParameters)
+            let data = try Data(contentsOf: parametersURL)
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard let tensors = json?["tensors"] as? [String: Any],
+                  let psiInfo = tensors["psi"] as? [String: Any],
+                  let encoded = psiInfo["data_base64"] as? String,
+                  let decoded = Data(base64Encoded: encoded, options: [.ignoreUnknownCharacters]),
+                  !decoded.isEmpty else {
+                throw TranscriberError.diarizationModelsMissing
+            }
+            var psi = [Float](repeating: 0, count: decoded.count / MemoryLayout<Float>.size)
+            _ = psi.withUnsafeMutableBytes { decoded.copyBytes(to: $0) }
+
+            return OfflineDiarizerModels(
+                segmentationModel: segmentation,
+                fbankModel: fbank,
+                embeddingModel: embedding,
+                pldaRhoModel: pldaRho,
+                pldaPsi: psi.map(Double.init),
+                compilationDuration: Date().timeIntervalSince(started)
+            )
+        }.value
+    }
+
     func addRecordings(_ urls: [URL]) {
         let files = urls.filter { url in
             var isDirectory: ObjCBool = false
@@ -638,12 +833,20 @@ final class TranscriberModel: ObservableObject {
 
     func start() {
         guard modelInstalled, !isRunning, !recordings.isEmpty else { return }
+        guard !selectedSpeakerMode.isEnabled || diarizationModelsInstalled else {
+            statusText = TranscriberError.diarizationModelsMissing.localizedDescription
+            return
+        }
         startRun(profiles: [selectedProfile], benchmark: false)
     }
 
     func startBenchmark() {
         let profiles = installedProfiles
         guard profiles.count >= 2, !isRunning, !recordings.isEmpty else { return }
+        guard !selectedSpeakerMode.isEnabled || diarizationModelsInstalled else {
+            statusText = TranscriberError.diarizationModelsMissing.localizedDescription
+            return
+        }
         startRun(profiles: profiles, benchmark: true)
     }
 
@@ -660,6 +863,7 @@ final class TranscriberModel: ObservableObject {
             statusText = TranscriberError.runtimeIncompatible.localizedDescription
             return
         }
+        let speakerMode = selectedSpeakerMode
         isRunning = true
         lastOutput = nil
         logText = "Transcription started. Detailed engine output is saved with each result."
@@ -684,7 +888,7 @@ final class TranscriberModel: ObservableObject {
                     }
                     workIDs[profile.id] = profileIDs
                 }
-                jobProgress.configure(workWeights)
+                jobProgress.configure(workWeights, diarizationEnabled: speakerMode.isEnabled)
                 startProgressMonitor()
                 primeCPUUtilization()
                 try await Task.sleep(nanoseconds: 250_000_000)
@@ -705,7 +909,7 @@ final class TranscriberModel: ObservableObject {
                             nextIndex += 1
                             active += 1
                             group.addTask {
-                                .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID))
+                                .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, speakerMode: speakerMode, jobID: workID))
                             }
                         }
                         if nextIndex < queued.count {
@@ -724,7 +928,7 @@ final class TranscriberModel: ObservableObject {
                             case .completed(let output):
                                 active -= 1
                                 completed += 1
-                                lastOutput = output.appendingPathComponent("transcript.txt")
+                                lastOutput = output.appendingPathComponent(speakerMode.isEnabled ? "transcript-speakers.txt" : "transcript.txt")
                             case .reevaluate:
                                 reevaluationPending = false
                             }
@@ -741,7 +945,7 @@ final class TranscriberModel: ObservableObject {
                                 nextIndex += 1
                                 active += 1
                                 group.addTask {
-                                    .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, jobID: workID))
+                                    .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, speakerMode: speakerMode, jobID: workID))
                                 }
                             }
                             if nextIndex < queued.count && !reevaluationPending {
@@ -903,7 +1107,14 @@ final class TranscriberModel: ObservableObject {
         return hours * 3600 + minutes * 60 + seconds
     }
 
-    private func transcribe(_ input: URL, plan: ExecutionPlan, profile: ModelProfile, benchmark: Bool, jobID: UUID) async throws -> URL {
+    private func transcribe(
+        _ input: URL,
+        plan: ExecutionPlan,
+        profile: ModelProfile,
+        benchmark: Bool,
+        speakerMode: SpeakerMode,
+        jobID: UUID
+    ) async throws -> URL {
         jobProgress.activate(jobID)
         defer { jobProgress.deactivate(jobID) }
         let fileManager = FileManager.default
@@ -922,15 +1133,37 @@ final class TranscriberModel: ObservableObject {
         defer { try? fileManager.removeItem(at: scratch) }
         let wav = scratch.appendingPathComponent("audio.wav")
         let outputStem = scratch.appendingPathComponent("transcript")
+        let diarizationResult = scratch.appendingPathComponent("speakers.json")
 
-        appendLog("\nTranscribing: \(input.lastPathComponent)\nStep 1/2: extracting the first audio stream...\n")
+        let stepCount = speakerMode.isEnabled ? 3 : 2
+        appendLog("\nTranscribing: \(input.lastPathComponent)\nStep 1/\(stepCount): extracting the first audio stream...\n")
         let mediaLog = try await runFFmpeg(input: input, output: wav, jobID: jobID)
         jobProgress.extractionCompleted(jobID)
         try Task.checkCancellation()
-        appendLog("Step 2/2: running \(profile.name) with the bundled engine...\n\n")
+        appendLog("Step 2/\(stepCount): running \(profile.name) with the bundled engine...\n\n")
 
         let started = Date()
         let engineLog = try await runWhisper(wav: wav, outputStem: outputStem, plan: plan, profile: profile, jobID: jobID)
+        jobProgress.transcriptionCompleted(jobID)
+        var diarizationLog: String?
+        if speakerMode.isEnabled {
+            try Task.checkCancellation()
+            let modeText = speakerMode.requestedCount.map { "exactly \($0) speakers" } ?? "automatic speaker count"
+            appendLog("Step 3/3: distinguishing speakers (\(modeText))...\n")
+            await diarizationGate.enter()
+            do {
+                diarizationLog = try await runDiarization(
+                    wav: wav,
+                    output: diarizationResult,
+                    mode: speakerMode,
+                    jobID: jobID
+                )
+                await diarizationGate.leave()
+            } catch {
+                await diarizationGate.leave()
+                throw error
+            }
+        }
         let elapsed = Date().timeIntervalSince(started)
         try Task.checkCancellation()
 
@@ -939,6 +1172,15 @@ final class TranscriberModel: ObservableObject {
             try fileManager.moveItem(at: outputStem.appendingPathExtension(ext), to: outputDirectory.appendingPathComponent("transcript.\(ext)"))
         }
         try engineLog.write(to: outputDirectory.appendingPathComponent("run.log"), atomically: true, encoding: .utf8)
+        if let diarizationLog {
+            try diarizationLog.write(to: outputDirectory.appendingPathComponent("diarization.log"), atomically: true, encoding: .utf8)
+            try writeSpeakerOutputs(
+                transcriptJSON: outputDirectory.appendingPathComponent("transcript.json"),
+                diarizationJSON: diarizationResult,
+                outputDirectory: outputDirectory,
+                mode: speakerMode
+            )
+        }
         let metadata = """
         # High-fidelity lecture transcript
 
@@ -949,6 +1191,7 @@ final class TranscriberModel: ObservableObject {
         - Model: \(profile.filename)
         - Model path: `\(modelURL(for: profile).path)`
         - Benchmark run: \(benchmark ? "yes" : "no")
+        - Speaker diarization: \(speakerModeDescription(speakerMode))
         - Decoder: Metal, beam 5, \(plan.threadsPerFile) CPU threads, VAD off, no prompt, previous-window context off
         - Runtime policy: v\(RuntimePolicy.bundled.policyVersion), compatible with \(RuntimePolicy.bundled.engine) \(RuntimePolicy.bundled.compatibleVersionContains)x
         - Effective arguments: `\(resolvedWhisperArguments(wav: wav, outputStem: outputStem, profile: profile, threads: plan.threadsPerFile).joined(separator: " "))`
@@ -964,7 +1207,8 @@ final class TranscriberModel: ObservableObject {
         appendLog("Packaging: \(archive.lastPathComponent)\n")
         try await runArchiver(directory: outputDirectory, archive: archive, jobID: jobID)
         jobProgress.complete(jobID)
-        appendLog("\nCompleted: \(outputDirectory.appendingPathComponent("transcript.txt").path)\n")
+        let primaryResult = outputDirectory.appendingPathComponent(speakerMode.isEnabled ? "transcript-speakers.txt" : "transcript.txt")
+        appendLog("\nCompleted: \(primaryResult.path)\n")
         appendLog("Archive: \(archive.path)\n")
         return outputDirectory
     }
@@ -1086,6 +1330,237 @@ final class TranscriberModel: ObservableObject {
         if Task.isCancelled { throw CancellationError() }
         guard status == 0 else { throw TranscriberError.processFailed(status) }
         return collector.snapshot()
+    }
+
+    private func runDiarization(wav: URL, output: URL, mode: SpeakerMode, jobID: UUID) async throws -> String {
+        var config = OfflineDiarizerConfig.default
+        if let count = mode.requestedCount {
+            config = config.withSpeakers(exactly: count)
+        }
+        let manager = OfflineDiarizerManager(config: config)
+        let modelsDirectory = diarizationModelsURL
+        let started = Date()
+        guard diarizationModelsArePresent() else {
+            throw TranscriberError.diarizationModelsMissing
+        }
+        let models = try await Self.loadLocalDiarizationModels(from: modelsDirectory)
+        manager.initialize(models: models)
+        try Task.checkCancellation()
+
+        let sourceResult = try AudioSourceFactory().makeDiskBackedSource(
+            from: wav,
+            targetSampleRate: config.segmentation.sampleRate
+        )
+        defer { sourceResult.source.cleanup() }
+        let progress = jobProgress
+        let result = try await manager.process(
+            audioSource: sourceResult.source,
+            audioLoadingSeconds: sourceResult.loadDuration
+        ) { completed, total in
+            if total > 0 {
+                progress.diarizationProgress(jobID, percent: (Double(completed) / Double(total)) * 100)
+            }
+        }
+        try Task.checkCancellation()
+        var segments: [DiarizationSegment] = []
+        segments.reserveCapacity(result.segments.count)
+        for segment in result.segments {
+            segments.append(
+                DiarizationSegment(
+                    speaker: segment.speakerId,
+                    start: Double(segment.startTimeSeconds),
+                    end: Double(segment.endTimeSeconds)
+                )
+            )
+        }
+        segments.sort { lhs, rhs in lhs.start == rhs.start ? lhs.end < rhs.end : lhs.start < rhs.start }
+        let payload = DiarizationPayload(
+            requestedSpeakers: mode.requestedCount,
+            detectedSpeakers: Set(segments.map { $0.speaker }).count,
+            segments: segments
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try encoder.encode(payload).write(to: output, options: .atomic)
+        jobProgress.diarizationProgress(jobID, percent: 100)
+        return """
+        FluidAudio offline diarization
+        Requested speakers: \(mode.requestedCount.map(String.init) ?? "automatic")
+        Detected speakers: \(payload.detectedSpeakers)
+        Segments: \(segments.count)
+        Processing time: \(String(format: "%.3f", Date().timeIntervalSince(started))) seconds
+        """
+    }
+
+    private func writeSpeakerOutputs(
+        transcriptJSON: URL,
+        diarizationJSON: URL,
+        outputDirectory: URL,
+        mode: SpeakerMode
+    ) throws {
+        let diarizationData = try Data(contentsOf: diarizationJSON)
+        let payload = try JSONDecoder().decode(DiarizationPayload.self, from: diarizationData)
+        let orderedSegments = payload.segments
+            .filter { $0.end > $0.start }
+            .sorted { lhs, rhs in lhs.start == rhs.start ? lhs.end < rhs.end : lhs.start < rhs.start }
+        guard !orderedSegments.isEmpty else { throw TranscriberError.invalidDiarizationOutput }
+
+        var speakerNames: [String: String] = [:]
+        for segment in orderedSegments where speakerNames[segment.speaker] == nil {
+            speakerNames[segment.speaker] = "Speaker \(speakerNames.count + 1)"
+        }
+        let normalizedSegments = orderedSegments.map {
+            DiarizationSegment(
+                speaker: speakerNames[$0.speaker] ?? $0.speaker,
+                start: $0.start,
+                end: $0.end
+            )
+        }
+
+        struct TimedToken {
+            var text: String
+            var start: Double
+            var end: Double
+            var speaker: String
+        }
+        let sourceData = try Data(contentsOf: transcriptJSON)
+        guard let root = try JSONSerialization.jsonObject(with: sourceData) as? [String: Any],
+              let transcription = root["transcription"] as? [[String: Any]] else {
+            throw TranscriberError.invalidDiarizationOutput
+        }
+        var tokens: [TimedToken] = []
+        var previousSpeaker: String?
+        for entry in transcription {
+            guard let rawTokens = entry["tokens"] as? [[String: Any]] else { continue }
+            for rawToken in rawTokens {
+                guard let text = rawToken["text"] as? String,
+                      !(text.hasPrefix("[_") && text.hasSuffix("]")),
+                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let offsets = rawToken["offsets"] as? [String: Any],
+                      let from = offsets["from"] as? NSNumber,
+                      let to = offsets["to"] as? NSNumber else { continue }
+                let start = from.doubleValue / 1000
+                let end = max(start, to.doubleValue / 1000)
+                let midpoint = (start + end) / 2
+                var chosen: DiarizationSegment?
+                var bestOverlap = 0.0
+                for segment in normalizedSegments {
+                    if segment.start > end, bestOverlap > 0 { break }
+                    let overlap = max(0, min(end, segment.end) - max(start, segment.start))
+                    if overlap > bestOverlap {
+                        bestOverlap = overlap
+                        chosen = segment
+                    } else if bestOverlap == 0, segment.start <= midpoint, midpoint <= segment.end {
+                        chosen = segment
+                    }
+                }
+                if chosen == nil {
+                    chosen = normalizedSegments.min {
+                        min(abs(midpoint - $0.start), abs(midpoint - $0.end))
+                            < min(abs(midpoint - $1.start), abs(midpoint - $1.end))
+                    }
+                }
+                let speaker = chosen?.speaker ?? previousSpeaker ?? "Speaker ?"
+                previousSpeaker = speaker
+                tokens.append(TimedToken(text: text, start: start, end: end, speaker: speaker))
+            }
+        }
+        guard !tokens.isEmpty else { throw TranscriberError.invalidDiarizationOutput }
+
+        if tokens.count >= 3 {
+            for index in 1..<(tokens.count - 1) {
+                let duration = tokens[index].end - tokens[index].start
+                if duration < 0.25,
+                   tokens[index - 1].speaker == tokens[index + 1].speaker,
+                   tokens[index].speaker != tokens[index - 1].speaker {
+                    tokens[index].speaker = tokens[index - 1].speaker
+                }
+            }
+        }
+
+        var turns: [SpeakerTurn] = []
+        var currentSpeaker = tokens[0].speaker
+        var currentStart = tokens[0].start
+        var currentEnd = tokens[0].end
+        var currentText = tokens[0].text
+        for token in tokens.dropFirst() {
+            let sameTurn = token.speaker == currentSpeaker
+                && token.start - currentEnd <= 1.25
+                && token.end - currentStart <= 12.0
+            if sameTurn {
+                currentText += token.text
+                currentEnd = max(currentEnd, token.end)
+            } else {
+                let text = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty {
+                    turns.append(SpeakerTurn(speaker: currentSpeaker, start: currentStart, end: currentEnd, text: text))
+                }
+                currentSpeaker = token.speaker
+                currentStart = token.start
+                currentEnd = token.end
+                currentText = token.text
+            }
+        }
+        let finalText = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalText.isEmpty {
+            turns.append(SpeakerTurn(speaker: currentSpeaker, start: currentStart, end: currentEnd, text: finalText))
+        }
+
+        let modeName = mode.requestedCount == nil ? "automatic" : "exact"
+        let detectedCount = Set(normalizedSegments.map(\.speaker)).count
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let timeline = SpeakerTimeline(
+            mode: modeName,
+            requestedSpeakers: mode.requestedCount,
+            detectedSpeakers: detectedCount,
+            segments: normalizedSegments
+        )
+        try encoder.encode(timeline).write(
+            to: outputDirectory.appendingPathComponent("speakers.json"), options: .atomic
+        )
+        let transcript = SpeakerTranscript(
+            mode: modeName,
+            requestedSpeakers: mode.requestedCount,
+            detectedSpeakers: detectedCount,
+            turns: turns
+        )
+        try encoder.encode(transcript).write(
+            to: outputDirectory.appendingPathComponent("transcript-speakers.json"), options: .atomic
+        )
+        let text = turns.map { "[\($0.speaker)] \($0.text)" }.joined(separator: "\n\n") + "\n"
+        try text.write(
+            to: outputDirectory.appendingPathComponent("transcript-speakers.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let subtitles = turns.enumerated().map { index, turn in
+            "\(index + 1)\n\(srtTimestamp(turn.start)) --> \(srtTimestamp(turn.end))\n[\(turn.speaker)] \(turn.text)"
+        }.joined(separator: "\n\n") + "\n"
+        try subtitles.write(
+            to: outputDirectory.appendingPathComponent("transcript-speakers.srt"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    private func srtTimestamp(_ seconds: Double) -> String {
+        let milliseconds = max(0, Int((seconds * 1000).rounded()))
+        return String(
+            format: "%02d:%02d:%02d,%03d",
+            milliseconds / 3_600_000,
+            (milliseconds / 60_000) % 60,
+            (milliseconds / 1_000) % 60,
+            milliseconds % 1_000
+        )
+    }
+
+    private func speakerModeDescription(_ mode: SpeakerMode) -> String {
+        switch mode {
+        case .disabled: return "disabled (legacy-compatible output only)"
+        case .automatic: return "FluidAudio offline, automatic speaker count"
+        case .exact(let count): return "FluidAudio offline, requested \(count) speakers"
+        }
     }
 
     private func resolvedWhisperArguments(wav: URL, outputStem: URL, profile: ModelProfile, threads: Int) -> [String] {
@@ -1380,6 +1855,48 @@ struct SetupCard: View {
     }
 }
 
+struct DiarizationModelsCard: View {
+    @ObservedObject var model: TranscriberModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: model.diarizationModelsInstalled ? "checkmark.seal.fill" : "person.2.wave.2")
+                    .foregroundStyle(model.diarizationModelsInstalled ? .green : Color.accentColor)
+                Text("Speaker Diarization").font(.headline)
+                Spacer()
+                Text(model.diarizationModelsInstalled ? "Built into the app" : "App resources missing")
+                    .font(.caption).foregroundStyle(model.diarizationModelsInstalled ? Color.secondary : Color.red)
+            }
+
+            Text("FluidAudio identifies who spoke when after Whisper finishes transcription. The model pack is included with Transcriber and works offline without a separate download.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if model.diarizationModelsInstalled {
+                HStack {
+                    Label("Built In", systemImage: "shippingbox.fill")
+                        .font(.caption).foregroundStyle(.green)
+                    Text("\(model.diarizationStorageText) · CC BY 4.0")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                }
+                Text("FluidInference/speaker-diarization-coreml")
+                    .font(.caption.weight(.semibold))
+                Text(model.diarizationModelsURL.path)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+            } else {
+                Label("The bundled speaker models could not be found. Reinstall Transcriber.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.red)
+            }
+        }
+        .padding(14)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.secondary.opacity(0.25)))
+    }
+}
+
 struct DropZone: View {
     let disabled: Bool
     let onFiles: ([URL]) -> Void
@@ -1492,9 +2009,33 @@ struct TranscribeView: View {
                     }
                 }.frame(width: 245).disabled(model.isRunning)
             }
+            HStack {
+                Label("Speaker labels", systemImage: "person.2.wave.2")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Picker("Speakers", selection: $model.selectedSpeakerMode) {
+                    ForEach(SpeakerMode.options, id: \.id) { option in
+                        Text(option.title).tag(option)
+                    }
+                }.frame(width: 285).disabled(model.isRunning)
+            }
             if model.selectedLanguage == "auto" {
                 Text("Auto detects one dominant language for the whole file; frequent language switching may be less reliable.")
                     .font(.caption2).foregroundStyle(.secondary)
+            }
+            if model.selectedSpeakerMode.isEnabled {
+                if model.diarizationModelsInstalled {
+                    Text("Speaker diarization runs locally after transcription. Specifying the correct count usually improves assignment.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    HStack {
+                        Label("The bundled speaker models are unavailable. Reinstall the app.", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption2).foregroundStyle(.orange)
+                        Spacer()
+                        Button("View Models…", action: openModels)
+                            .controlSize(.small)
+                    }
+                }
             }
             DropZone(disabled: model.isRunning, onFiles: model.addRecordings)
             HStack {
@@ -1509,11 +2050,11 @@ struct TranscribeView: View {
                     Button("Cancel") { model.cancel() }
                 } else {
                     Button("Bench Installed Models") { model.startBenchmark() }
-                        .disabled(model.recordings.isEmpty || model.installedProfiles.count < 2)
+                        .disabled(model.recordings.isEmpty || model.installedProfiles.count < 2 || (model.selectedSpeakerMode.isEnabled && !model.diarizationModelsInstalled))
                         .help("Transcribe the entire queue with every installed model for side-by-side quality review")
                     Button("Transcribe \(model.recordings.isEmpty ? "" : "(\(model.recordings.count))")") { model.start() }
                         .buttonStyle(.borderedProminent)
-                        .disabled(model.recordings.isEmpty || !model.modelInstalled)
+                        .disabled(model.recordings.isEmpty || !model.modelInstalled || (model.selectedSpeakerMode.isEnabled && !model.diarizationModelsInstalled))
                         .keyboardShortcut(.return, modifiers: [.command])
                 }
             }
@@ -1557,10 +2098,11 @@ struct ModelsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 15) {
                 Text("Performance & Models").font(.title2.bold())
-                Text("Compact is the fast everyday default. Maximum Fidelity is the accuracy pick when time matters less; Balanced offers a strong speed-to-quality tradeoff.")
+                Text("Manage the transcription and speaker-recognition models stored locally on this Mac. Compact remains the fast everyday transcription default.")
                     .foregroundStyle(.secondary)
                 HardwareCard(profile: model.hardware)
                 SetupCard(model: model)
+                DiarizationModelsCard(model: model)
             }.padding(.horizontal, 2)
         }
     }

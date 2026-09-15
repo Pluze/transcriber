@@ -4,6 +4,13 @@ A standalone, local macOS app for high-fidelity lecture transcription. Drop any
 media file from which FFmpeg can extract an audio stream, choose a model and
 receive TXT, SRT, full JSON, logs, and run metadata beside the source file.
 
+Speaker labeling is optional and defaults to off, preserving the original
+Whisper-only behavior and output files. A single menu offers automatic speaker
+counting or an exact count from 2 through 30. Enabled runs use FluidAudio's
+offline diarization pipeline after Whisper and add `transcript-speakers.txt`,
+`transcript-speakers.srt`, `transcript-speakers.json`, `speakers.json`, and
+`diarization.log`; the original `transcript.*` files remain unchanged.
+
 ## User experience
 
 - No Homebrew or Python is required after installation.
@@ -17,6 +24,8 @@ receive TXT, SRT, full JSON, logs, and run metadata beside the source file.
 - Engine progress is parsed without streaming the verbose log into the UI; full
   diagnostic output remains in each result directory.
 - Temporary 16 kHz mono PCM is deleted after every run.
+- Speaker diarization models are bundled with the app and shown in their own
+  card in the Models tab. Speaker labeling works offline with no extra download.
 
 The default `Compact` model prioritizes fast everyday transcription and low
 storage use. `Maximum Fidelity` remains the accuracy pick when processing time
@@ -44,7 +53,7 @@ unidentified developer.
 
 ## Build
 
-Requirements: Apple Silicon Mac, macOS 13.3+, Xcode command-line tools, `curl`,
+Requirements: Apple Silicon Mac, macOS 14+, Xcode command-line tools, `curl`,
 `make`, and `pkg-config`-free FFmpeg prerequisites included with macOS.
 
 ```sh
@@ -67,16 +76,19 @@ keychain profile.
 
 ## Runtime storage
 
-Models live in `~/Library/Application Support/Transcriber/models`. Outputs are
-created beside their source files as a `<name>.transcript` directory and a
-matching `<name>.transcript.zip` archive.
+Downloaded Whisper models live in
+`~/Library/Application Support/Transcriber/models`; speaker diarization models
+are read from the app bundle. Outputs are created beside their source files as a
+`<name>.transcript` directory and a matching `<name>.transcript.zip` archive.
 
 ## Third-party components
 
 Transcriber's original source code is licensed under the MIT License; see
 `LICENSE`.
 
-This project bundles whisper.cpp and an LGPL-only FFmpeg build. Notices are in
+This project bundles whisper.cpp, FluidAudio, and an LGPL-only FFmpeg build. Notices are in
 `ThirdParty/licenses` and are copied into the app bundle. Each tagged GitHub
 Release also includes the exact FFmpeg source archive used to build its binary;
 the reproducible configure options are recorded in `scripts/build-ffmpeg.sh`.
+The bundled FluidInference speaker diarization model pack is distributed under
+CC BY 4.0; its attribution notice is included with the other licenses.

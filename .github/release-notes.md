@@ -1,5 +1,17 @@
 ## Install on macOS
 
+### v1.3.0
+
+- Adds optional speaker labeling with automatic speaker-count detection or an
+  exact count from 2 through 30; the default remains off for compatibility.
+- Keeps the original Whisper transcript files unchanged and writes separate
+  speaker-labeled TXT, SRT, JSON, timeline, and diagnostic outputs.
+- Bundles the FluidAudio speaker diarization models in the app, so speaker
+  labeling works offline without a first-run model download.
+- Adds the speaker model pack to the Models panel with its bundled size,
+  source, and CC BY 4.0 attribution.
+- Sets the minimum supported system to macOS 14.
+
 ### v1.2.3
 
 - Makes Compact the default model for fast everyday transcription, small
