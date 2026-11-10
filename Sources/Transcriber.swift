@@ -460,8 +460,38 @@ enum TranscriberError: LocalizedError {
     }
 }
 
+enum RecordingStatus: String {
+    case queued = "Queued"
+    case running = "Running"
+    case completed = "Completed"
+    case failed = "Failed"
+    case cancelled = "Cancelled"
+    case unfinished = "Incomplete"
+
+    var symbol: String {
+        switch self {
+        case .queued: return "clock"
+        case .unfinished: return "minus.circle"
+        case .running: return "waveform"
+        case .completed: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        case .cancelled: return "stop.circle"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .queued, .cancelled, .unfinished: return .secondary
+        case .running: return .accentColor
+        case .completed: return .green
+        case .failed: return .red
+        }
+    }
+}
+
 @MainActor
 final class TranscriberModel: ObservableObject {
+    @Published private(set) var recordingStatuses: [URL: RecordingStatus] = [:]
     @Published var recordings: [URL] = []
     @Published var logText = "Drop recordings here or choose files to begin."
     @Published var statusText = "Ready"
@@ -819,12 +849,14 @@ final class TranscriberModel: ObservableObject {
 
     func removeRecording(_ url: URL) {
         guard !isRunning else { return }
+        recordingStatuses.removeValue(forKey: url)
         recordings.removeAll { $0 == url }
         statusText = recordings.isEmpty ? "Ready" : "Ready to transcribe \(recordings.count) file\(recordings.count == 1 ? "" : "s")"
     }
 
     func clear() {
         guard !isRunning else { return }
+        recordingStatuses.removeAll()
         recordings.removeAll()
         lastOutput = nil
         logText = "Drop recordings here or choose files to begin."
@@ -873,6 +905,7 @@ final class TranscriberModel: ObservableObject {
         activeProgress = nil
         queueCompletionText = nil
         activeCompletionText = nil
+        recordingStatuses.removeAll()
         let queued = recordings
         transcriptionTask = Task {
             do {
@@ -909,7 +942,7 @@ final class TranscriberModel: ObservableObject {
                             nextIndex += 1
                             active += 1
                             group.addTask {
-                                .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, speakerMode: speakerMode, jobID: workID))
+                                .completed(try await self.transcribeForQueue(recording, finalProfile: profileIndex == profiles.count - 1, plan: jobPlan, profile: profile, benchmark: benchmark, speakerMode: speakerMode, jobID: workID))
                             }
                         }
                         if nextIndex < queued.count {
@@ -945,7 +978,7 @@ final class TranscriberModel: ObservableObject {
                                 nextIndex += 1
                                 active += 1
                                 group.addTask {
-                                    .completed(try await self.transcribe(recording, plan: jobPlan, profile: profile, benchmark: benchmark, speakerMode: speakerMode, jobID: workID))
+                                    .completed(try await self.transcribeForQueue(recording, finalProfile: profileIndex == profiles.count - 1, plan: jobPlan, profile: profile, benchmark: benchmark, speakerMode: speakerMode, jobID: workID))
                                 }
                             }
                             if nextIndex < queued.count && !reevaluationPending {
@@ -969,6 +1002,9 @@ final class TranscriberModel: ObservableObject {
             } catch {
                 statusText = "Failed — \(error.localizedDescription)"
                 appendLog("\nERROR: \(error.localizedDescription)\n")
+            }
+            for input in queued where (recordingStatuses[input] ?? .queued) == .queued {
+                recordingStatuses[input] = .unfinished
             }
             isRunning = false
             stopProgressMonitor()
@@ -1105,6 +1141,27 @@ final class TranscriberModel: ObservableObject {
               let minutes = Double(output.substring(with: match.range(at: 2))),
               let seconds = Double(output.substring(with: match.range(at: 3))) else { return nil }
         return hours * 3600 + minutes * 60 + seconds
+    }
+
+    private func transcribeForQueue(
+        _ input: URL,
+        finalProfile: Bool,
+        plan: ExecutionPlan,
+        profile: ModelProfile,
+        benchmark: Bool,
+        speakerMode: SpeakerMode,
+        jobID: UUID
+    ) async throws -> URL {
+        recordingStatuses[input] = .running
+        do {
+            try Task.checkCancellation()
+            let output = try await transcribe(input, plan: plan, profile: profile, benchmark: benchmark, speakerMode: speakerMode, jobID: jobID)
+            recordingStatuses[input] = finalProfile ? .completed : .queued
+            return output
+        } catch {
+            recordingStatuses[input] = Task.isCancelled || error is CancellationError ? .cancelled : .failed
+            throw error
+        }
     }
 
     private func transcribe(
@@ -2070,6 +2127,10 @@ struct TranscribeView: View {
                                 Text(url.deletingLastPathComponent().path).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             }
                             Spacer()
+                            let status = model.recordingStatuses[url] ?? .queued
+                            Label(status.rawValue, systemImage: status.symbol)
+                                .font(.caption)
+                                .foregroundStyle(status.color)
                             Button { model.removeRecording(url) } label: { Image(systemName: "xmark.circle.fill") }
                                 .buttonStyle(.plain).foregroundStyle(.secondary).disabled(model.isRunning)
                         }
